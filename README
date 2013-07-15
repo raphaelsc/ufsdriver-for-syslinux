@@ -1,0 +1,55 @@
+Unix Fast File System (UFS/FFS) 1/2 - (usage/install)
+-----
+To: syslinux@zytor.com
+
+Original version can be found here: http://www.syslinux.org/pipermail/syslinux/2013-July/020511.html
+
+There is a confusion about the name of this file system, then I decided to contact the author who replied:
+"The name has always been confusing (my bad). The code is broken into two parts, the part that handles naming 
+(UFS where the U stands for Unix), and the part that handles disk layout (FFS where the F stands for Fast). 
+When the two parts are put together they are called UFS/FFS or more commonly just UFS."
+
+Dependency:
+Package: ufsutils (UFS filesystems utilities)
+
+*** NOTES ***
+- These steps were only made under a GNU/Linux environment. Thus, I can't guarantee good functionality for any system
+other than Linux.
+
+- To add UFS write support to Linux, you need a kernel with the option CONFIG_UFS_FS_WRITE enabled or at least
+configured as a module. 
+To the latter case, just load the module ufs.ko with modprobe (probably located at: /lib/modules/). 
+If this option wasn't even configured as a module, then you need to recompile your kernel with that option enabled.
+Further information can be found here: http://oz123.github.io/writings/2012-11-26-enable-ufs-write-support-debian/
+
+Creating an UFS image:
+    sudo dd if=/dev/zero of=<image> bs= count=;
+    - UFS1:
+    sudo mkfs.ufs -O 1 <image>;
+    - UFS2:
+    sudo mkfs.ufs <image>;
+
+Mounting an UFS image:
+    - UFS1:
+    sudo mount -t ufs -o rw,loop,ufstype=44bsd <image> <mountpoint>;
+    - UFS2:
+    sudo mount -t ufs -o rw,loop,ufstype=ufs2 <image> <mountpoint>;
+
+Installing syslinux on an UFS image:
+    1- The UFS support to the extlinux installer wasn't yet added to the official tree of Syslinux, then you will have to apply the 
+following patches yourself:
+    http://www.syslinux.org/pipermail/syslinux/2013-July/020491.html
+    http://www.syslinux.org/pipermail/syslinux/2013-July/020492.html
+
+    2- After applying the patches and reinstalling the extlinux, just use the following command:
+    sudo extlinux -i <mountpoint>; 
+
+    3- Finally, copy the initrd and the kernel image into the mount point and set up the syslinux config file.
+    
+Hope you enjoyed it :)
+
+Regards,
+Raphael S. Carvalho
+
+
+    
