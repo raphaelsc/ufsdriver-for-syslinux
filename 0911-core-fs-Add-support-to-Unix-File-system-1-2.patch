@@ -1,0 +1,916 @@
+From 2b81bcbb5c5fd6565f43575889e5c4e31be92996 Mon Sep 17 00:00:00 2001
+From: Raphael S.Carvalho <raphael.scarv@gmail.com>
+Date: Fri, 12 Jul 2013 20:52:00 -0300
+Subject: [PATCH 001/001] core/fs: Add support to Unix File system 1/2.
+
+It's already loading modules successfully, and both UFS version 1 and 2
+seems to be working correctly.
+
+Special thanks to Paulo Alcantara and Matt Fleming for being always ready to help me
+and give feedback.
+
+Signed-off-by: Raphael S.Carvalho <raphael.scarv@gmail.com>
+---
+ core/fs/ufs/bmap.c |  202 ++++++++++++++++++++++++++
+ core/fs/ufs/ufs.c  |  404 ++++++++++++++++++++++++++++++++++++++++++++++++++++
+ core/fs/ufs/ufs.h  |  253 ++++++++++++++++++++++++++++++++
+ core/ldlinux.asm   |    2 +
+ 4 files changed, 861 insertions(+), 0 deletions(-)
+ create mode 100644 core/fs/ufs/bmap.c
+ create mode 100644 core/fs/ufs/ufs.c
+ create mode 100644 core/fs/ufs/ufs.h
+
+diff --git a/core/fs/ufs/bmap.c b/core/fs/ufs/bmap.c
+new file mode 100644
+index 0000000..117daef
+--- /dev/null
++++ b/core/fs/ufs/bmap.c
+@@ -0,0 +1,202 @@
++/*
++ * Copyright (C) 2013 Raphael S. Carvalho <raphael.scarv@gmail.com>
++ *
++ * Partially taken from fs/ext2/bmap.c
++ * This file was modified according UFS1/2 needs.
++ *
++ * Copyright (C) 2009 Liu Aleaxander -- All rights reserved. This file
++ * may be redistributed under the terms of the GNU Public License.
++ */
++
++#include <stdio.h>
++#include <dprintf.h>
++#include <fs.h>
++#include <disk.h>
++#include <cache.h>
++#include "ufs.h"
++
++/*
++ * Copy blk address into buffer, this was needed since UFS1/2 addr size
++ * in blk maps differs from each other (32/64 bits respectivelly).
++ */
++static inline uint64_t
++get_blkaddr (const uint8_t *blk, uint32_t index, uint32_t shift)
++{
++    uint64_t addr = 0;
++
++    memcpy((uint8_t *) &addr,
++	   (uint8_t *) blk + (index << shift),
++	    1 << shift);
++
++    return addr;
++}
++
++/*
++ * Scan forward in a range of blocks to see if they are contiguous,
++ * then return the initial value.
++ */
++static uint64_t
++scan_set_nblocks(const uint8_t *map, uint32_t index, uint32_t addr_shift,
++		  unsigned int count, size_t *nblocks)
++{
++    uint64_t addr;
++    uint64_t blk = get_blkaddr(map, index, addr_shift);
++
++    /*
++     * Block spans 8 fragments, then address is interleaved by 8.
++     * This code works for either 32/64 sized addresses.
++     */
++    if (nblocks) {
++	uint32_t skip = blk ? FRAGMENTS_PER_BLK : 0;
++	uint32_t next = blk + skip;
++	size_t   cnt = 1;
++
++	/* Get address of starting blk pointer */
++	map += (index << addr_shift);
++
++	//ufs_debug("[scan] start blk: %u\n", blk);
++	//ufs_debug("[scan] count (nr of blks): %u\n", count);
++	/* Go up to the end of blk map */
++	while (--count) {
++	    map += 1 << addr_shift;
++	    addr = get_blkaddr(map, 0, addr_shift);
++#if 0
++	    /* Extra debugging info (Too much prints) */
++	    ufs_debug("[scan] addr: %u next: %u\n", addr, next);
++#endif
++	    if (addr == next) {
++		cnt++;
++		next += skip;
++	    } else {
++		break;
++	    }
++	}
++	*nblocks = cnt;
++	ufs_debug("[scan] nblocks: %u\n", cnt);
++	//ufs_debug("[scan] end blk: %u\n", next - FRAGMENTS_PER_BLK);
++    }
++
++    return blk;
++}
++
++/*
++ * The actual indirect block map handling - the block passed in should
++ * be relative to the beginning of the particular block hierarchy.
++ *
++ * @shft_per_blk: shift to get nr. of addresses in a block.
++ * @mask_per_blk: mask to limit the max nr. of addresses in a block.
++ * @addr_count:   nr. of addresses in a block.
++ */
++static uint64_t
++bmap_indirect(struct fs_info *fs, uint64_t start, uint32_t block,
++	      int levels, size_t *nblocks)
++{
++    const uint32_t shft_per_blk = fs->block_shift - UFS_SB(fs)->addr_shift;
++    const uint32_t addr_count = (1 << shft_per_blk);
++    const uint32_t mask_per_blk = addr_count - 1;
++    const uint8_t *blk = NULL;
++    uint32_t index = 0;
++
++    while (levels--) {
++	if (!start) {
++	    if (nblocks)
++		*nblocks = addr_count << (levels * shft_per_blk);
++	    return 0;
++	}
++
++	blk = get_cache(fs->fs_dev, frag_to_blk(fs, start));
++	index = (block >> (levels * shft_per_blk)) & mask_per_blk;
++	start = get_blkaddr(blk, index, UFS_SB(fs)->addr_shift);
++    }
++
++    return scan_set_nblocks(blk, index, UFS_SB(fs)->addr_shift,
++			    addr_count - index, nblocks);
++}
++
++/*
++ * Handle the traditional block map, like indirect, double indirect
++ * and triple indirect
++ */
++uint64_t ufs_bmap (struct inode *inode, block_t block, size_t *nblocks)
++{
++    uint32_t shft_per_blk, ptrs_per_blk;
++    static uint32_t indir_blks, double_blks, triple_blks;
++    struct fs_info *fs = inode->fs;
++
++    /* Initialize static values */
++    if (!indir_blks) {
++	shft_per_blk = fs->block_shift - UFS_SB(fs)->addr_shift;
++	ptrs_per_blk = fs->block_size >> UFS_SB(fs)->addr_shift;
++
++	indir_blks = ptrs_per_blk;
++	double_blks = ptrs_per_blk << shft_per_blk;
++	triple_blks = double_blks << shft_per_blk;
++    }
++
++    /*
++     * direct blocks
++     * (UFS2_ADDR_SHIFT) is also used for UFS1 because its direct ptr array
++     * was extended to 64 bits.
++     */
++    if (block < UFS_DIRECT_BLOCKS)
++	return scan_set_nblocks((uint8_t *) PVT(inode)->direct_blk_ptr,
++				block, UFS2_ADDR_SHIFT,
++				UFS_DIRECT_BLOCKS - block, nblocks);
++
++    /* indirect blocks */
++    block -= UFS_DIRECT_BLOCKS;
++    if (block < indir_blks)
++	return bmap_indirect(fs, PVT(inode)->indirect_blk_ptr,
++			     block, 1, nblocks);
++
++    /* double indirect blocks */
++    block -= indir_blks;
++    if (block < double_blks)
++	return bmap_indirect(fs, PVT(inode)->double_indirect_blk_ptr,
++			     block, 2, nblocks);
++
++    /* triple indirect blocks */
++    block -= double_blks;
++    if (block < triple_blks)
++	return bmap_indirect(fs, PVT(inode)->triple_indirect_blk_ptr,
++			     block, 3, nblocks);
++
++    /* This can't happen... */
++    return 0;
++}
++
++/*
++ * Next extent for getfssec
++ * "Remaining sectors" means (lstart & blkmask).
++ */
++int ufs_next_extent(struct inode *inode, uint32_t lstart)
++{
++    struct fs_info *fs = inode->fs;
++    int blktosec =  BLOCK_SHIFT(fs) - SECTOR_SHIFT(fs);
++    int frag_shift = BLOCK_SHIFT(fs) - UFS_SB(fs)->c_blk_frag_shift;
++    int blkmask = (1 << blktosec) - 1;
++    block_t block;
++    size_t nblocks = 0;
++
++    ufs_debug("ufs_next_extent:\n");
++    block = ufs_bmap(inode, lstart >> blktosec, &nblocks);
++    ufs_debug("blk: %u\n", block);
++
++    if (!block) // Sparse block
++	inode->next_extent.pstart = EXTENT_ZERO;
++    else
++	/*
++	 * Convert blk into sect addr and add the remaining
++	 * sectors into pstart (sector start address).
++	 */
++	inode->next_extent.pstart =
++	    ((sector_t) (block << frag_shift) >> SECTOR_SHIFT(fs)) |
++	    (lstart & blkmask);
++
++    /*
++     * Subtract the remaining sectors from len since these sectors
++     * were added to pstart (sector start address).
++     */
++    inode->next_extent.len = (nblocks << blktosec) - (lstart & blkmask);
++    return 0;
++}
+\ No newline at end of file
+diff --git a/core/fs/ufs/ufs.c b/core/fs/ufs/ufs.c
+new file mode 100644
+index 0000000..25c8526
+--- /dev/null
++++ b/core/fs/ufs/ufs.c
+@@ -0,0 +1,404 @@
++/*
++ * Copyright (C) 2013 Raphael S. Carvalho <raphael.scarv@gmail.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the
++ * Free Software Foundation, Inc.,
++ * 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
++*/
++
++#include <dprintf.h>
++#include <stdio.h>
++#include <string.h>
++#include <sys/dirent.h>
++#include <cache.h>
++#include <disk.h>
++#include <fs.h>
++#include <minmax.h>
++#include "core.h"
++#include "ufs.h"
++
++/*
++ * Read the super block and check magic fields based on
++ * passed paramaters.
++ */
++static bool
++do_checksb(struct ufs_super_block *sb, struct disk *disk,
++	    const uint32_t sblock_off, const uint32_t ufs_smagic)
++{
++    uint32_t lba;
++    static uint32_t count;
++
++    /* How many sectors are needed to fill sb struct */
++    if (!count)
++	count = sizeof *sb >> disk->sector_shift;
++    /* Get lba address based on sector size of disk */
++    lba = sblock_off >> (disk->sector_shift);
++    /* Read super block */
++    disk->rdwr_sectors(disk, sb, lba, count, 0);
++
++    if (sb->magic == ufs_smagic)
++	return true;
++
++    return false;
++}
++
++/*
++ * Go through all possible ufs superblock offsets.
++ * TODO: Add UFS support to removable media (sb offset: 0).
++ */
++static int
++ufs_checksb(struct ufs_super_block *sb, struct disk *disk)
++{
++    /* Check for UFS1 sb */
++    if (do_checksb(sb, disk, UFS1_SBLOCK_OFFSET, UFS1_SUPER_MAGIC))
++	return UFS1;
++    /* Check for UFS2 sb */
++    if (do_checksb(sb, disk, UFS2_SBLOCK_OFFSET, UFS2_SUPER_MAGIC))
++	return UFS2;
++    /* UFS2 may also exist in 256k-, but this isn't the default */
++    if (do_checksb(sb, disk, UFS2_SBLOCK2_OFFSET, UFS2_SUPER_MAGIC))
++	return UFS2_PIGGY;
++
++    return NONE;
++}
++
++/*
++ * lblock stands for linear block address,
++ * whereas pblock is the actual blk ptr to get data from.
++ *
++ * UFS1/2 use frag addrs rather than blk ones, then
++ * the offset into the block must be calculated.
++ */
++static const void *
++ufs_get_cache(struct inode *inode, block_t lblock)
++{
++    const void *data;
++    struct fs_info *fs = inode->fs;
++    struct ufs_sb_info *sb = UFS_SB(inode->fs);
++    uint64_t frag_addr, frag_offset;
++    uint32_t frag_shift;
++    block_t pblock;
++
++    frag_addr = ufs_bmap(inode, lblock, NULL);
++    if (!frag_addr)
++	return NULL;
++
++    frag_shift = fs->block_shift - sb->c_blk_frag_shift;
++    /* Get fragment byte address */
++    frag_offset = frag_addr << frag_shift;
++    /* Convert frag addr to blk addr */
++    pblock = frag_to_blk(fs, frag_addr);
++    /* Read the blk */
++    data = get_cache(fs->fs_dev, pblock);
++
++    /* Return offset into block */
++    return data + (frag_offset & (fs->block_size - 1));
++}
++
++/*
++ * Based on fs/ext2/ext2.c
++ * find a dir entry, return it if found, or return NULL.
++ */
++static const struct ufs_dir_entry *
++ufs_find_entry(struct fs_info *fs, struct inode *inode, const char *dname)
++{
++    const struct ufs_dir_entry *dir;
++    const char *data;
++    int32_t i, offset, maxoffset;
++    block_t index = 0;
++
++    ufs_debug("ufs_find_entry: dname: %s ", dname);
++    for (i = 0; i < inode->size; i += fs->block_size) {
++	data = ufs_get_cache(inode, index++);
++	offset = 0;
++	maxoffset = min(inode->size-i, fs->block_size);
++
++	/* The smallest possible size is 9 bytes */
++	while (offset < maxoffset-8) {
++	    dir = (const struct ufs_dir_entry *)(data + offset);
++	    if (dir->dir_entry_len > maxoffset - offset)
++		break;
++
++	    /*
++	     * Name fields are variable-length and null terminated,
++	     * then it's possible to use strcmp directly.
++	     */
++	    if (dir->inode_value && !strcmp(dname, (const char *)dir->name)) {
++		ufs_debug("(found)\n");
++		return dir;
++	    }
++	    offset += dir->dir_entry_len;
++	}
++    }
++    ufs_debug("(not found)\n");
++    return NULL;
++}
++
++/*
++ * Get either UFS1/2 inode structures.
++ */
++static const void *
++ufs_get_inode(struct fs_info *fs, int inr)
++{
++    const char *data;
++    uint32_t group, inode_offset, inode_table;
++    uint32_t block_num, block_off;
++
++    /* Get cylinder group nr. */
++    group = inr / UFS_SB(fs)->inodes_per_cg;
++    /*
++     * Ensuring group will not exceed the range 0:groups_count-1.
++     * By the way, this should *never* happen.
++     * Unless the (on-disk) fs structure is corrupted!
++     */
++    if (group >= UFS_SB(fs)->groups_count) {
++	printf("ufs_get_inode: "
++		"group(%d) exceeded the avail. range (0:%d)\n",
++		group, UFS_SB(fs)->groups_count - 1);
++	return NULL;
++    }
++
++    /* Offset into inode table of the cylinder group */
++    inode_offset = inr % UFS_SB(fs)->inodes_per_cg;
++    /* Get inode table blk addr respective to cylinder group */
++    inode_table = (group * UFS_SB(fs)->blocks_per_cg) +
++	UFS_SB(fs)->off_inode_tbl;
++    /* Calculating staggering offset (UFS1 only!) */
++    if (UFS_SB(fs)->fs_type == UFS1)
++	inode_table += UFS_SB(fs)->ufs1.delta_value *
++	    (group & UFS_SB(fs)->ufs1.cycle_mask);
++
++    /* Get blk nr and offset into the blk */
++    block_num = inode_table + inode_offset / UFS_SB(fs)->inodes_per_block;
++    block_off = inode_offset % UFS_SB(fs)->inodes_per_block;
++
++    /*
++     * Read the blk from the blk addr previously computed;
++     * Calc the inode struct offset into the read block.
++     */
++    data = get_cache(fs->fs_dev, block_num);
++    return data + block_off * UFS_SB(fs)->inode_size;
++}
++
++static struct inode *
++ufs1_iget_by_inr(struct fs_info *fs, uint32_t inr)
++{
++    const struct ufs1_inode *ufs_inode;
++    struct inode *inode;
++    uint64_t *dest;
++    uint32_t *source;
++    int i;
++
++    ufs_inode = (struct ufs1_inode *) ufs_get_inode(fs, inr);
++    if (!ufs_inode)
++	return NULL;
++
++    if (!(inode = alloc_inode(fs, inr, sizeof(struct ufs_inode_pvt))))
++	return NULL;
++
++    /* UFS1 doesn't support neither creation nor deletion times */
++    inode->refcnt  = ufs_inode->link_count;
++    inode->mode    = IFTODT(ufs_inode->file_mode);
++    inode->size    = ufs_inode->size;
++    inode->atime   = ufs_inode->a_time;
++    inode->mtime   = ufs_inode->m_time;
++    inode->blocks  = ufs_inode->blocks_held;
++    inode->flags   = ufs_inode->flags;
++
++    /*
++     * Copy and extend blk pointers to 64 bits, so avoid
++     * having two structures for inode private.
++     */
++    dest = (uint64_t *) inode->pvt;
++    source = (uint32_t *) ufs_inode->direct_blk_ptr;
++    for (i = 0; i < UFS_NBLOCKS; i++)
++	dest[i] = ((uint64_t) source[i]) & 0xFFFFFFFF;
++
++    return inode;
++}
++
++static struct inode *
++ufs2_iget_by_inr(struct fs_info *fs, uint32_t inr)
++{
++    const struct ufs2_inode *ufs_inode;
++    struct inode *inode;
++
++    ufs_inode = (struct ufs2_inode *) ufs_get_inode(fs, inr);
++    if (!ufs_inode)
++	return NULL;
++
++    if (!(inode = alloc_inode(fs, inr, sizeof(struct ufs_inode_pvt))))
++	return NULL;
++
++    /* UFS2 doesn't support deletion time */
++    inode->refcnt  = ufs_inode->link_count;
++    inode->mode    = IFTODT(ufs_inode->file_mode);
++    inode->size    = ufs_inode->size;
++    inode->atime   = ufs_inode->a_time;
++    inode->ctime   = ufs_inode->creat_time;
++    inode->mtime   = ufs_inode->m_time;
++    inode->blocks  = ufs_inode->bytes_held >> fs->block_shift;
++    inode->flags   = ufs_inode->flags;
++    memcpy(inode->pvt, ufs_inode->direct_blk_ptr,
++	   sizeof(uint64_t) * UFS_NBLOCKS);
++
++    return inode;
++}
++
++/*
++ * Both ufs_iget_root and ufs_iget callback based on ufs type.
++ */
++static struct inode *
++ufs_iget_root(struct fs_info *fs)
++{
++    return UFS_SB(fs)->ufs_iget_by_inr(fs, UFS_ROOT_INODE);
++}
++
++static struct inode *
++ufs_iget(const char *dname, struct inode *parent)
++{
++    const struct ufs_dir_entry *dir;
++    struct fs_info *fs = parent->fs;
++
++    dir = ufs_find_entry(fs, parent, dname);
++    if (!dir)
++	return NULL;
++
++    return UFS_SB(fs)->ufs_iget_by_inr(fs, dir->inode_value);
++}
++
++static int ufs_readlink(struct inode *inode, char *buf)
++{
++    ufs_debug("ufs_readlink\n");
++    return inode->size;
++}
++
++static inline enum dir_type_flags get_inode_mode(uint8_t attr)
++{
++    return (attr & UFS_DTYPE_DIR) ? DT_DIR : DT_REG;
++}
++
++/*
++ * Read one directory entry at a time
++ */
++static int ufs_readdir(struct file *file, struct dirent *dirent)
++{
++    struct fs_info *fs = file->fs;
++    struct inode *inode = file->inode;
++    const struct ufs_dir_entry *dir;
++    const char *data;
++    block_t index = file->offset >> fs->block_shift;
++
++    if (file->offset >= inode->size)
++	return -1;		/* End of file */
++
++    data = ufs_get_cache(inode, index);
++    dir = (const struct ufs_dir_entry *)
++	(data + (file->offset & (BLOCK_SIZE(fs) - 1)));
++
++    dirent->d_ino = dir->inode_value;
++    dirent->d_off = file->offset;
++    dirent->d_reclen = offsetof(struct dirent, d_name) + dir->name_length + 1;
++    dirent->d_type = get_inode_mode(dir->file_type);
++    memcpy(dirent->d_name, dir->name, dir->name_length);
++    dirent->d_name[dir->name_length] = '\0';
++
++    file->offset += dir->dir_entry_len;  /* Update for next reading */
++
++    return 0;
++}
++
++static inline struct ufs_sb_info *
++set_ufs_info(struct ufs_super_block *sb, int ufs_type)
++{
++    struct ufs_sb_info *sbi;
++
++    sbi = malloc(sizeof *sbi);
++    if (!sbi)
++	malloc_error("ufs_sb_info structure");
++
++    /* Setting up UFS-dependent info */
++    if (ufs_type == UFS1) {
++	sbi->inode_size = sizeof (struct ufs1_inode);
++	sbi->groups_count = sb->ufs1.nr_frags / sb->frags_per_cg;
++	sbi->ufs1.delta_value = sb->ufs1.delta_value;
++	sbi->ufs1.cycle_mask = sb->ufs1.cycle_mask;
++	sbi->ufs_iget_by_inr = ufs1_iget_by_inr;
++	sbi->addr_shift = UFS1_ADDR_SHIFT;
++    } else { // UFS2 or UFS2_PIGGY
++	sbi->inode_size = sizeof (struct ufs2_inode);
++	sbi->groups_count = sb->ufs2.nr_frags / sb->frags_per_cg;
++	sbi->ufs_iget_by_inr = ufs2_iget_by_inr;
++	sbi->addr_shift = UFS2_ADDR_SHIFT;
++    }
++    sbi->inodes_per_block = sb->block_size / sbi->inode_size;
++    sbi->inodes_per_cg = sb->inodes_per_cg;
++    sbi->blocks_per_cg = sb->frags_per_cg >> sb->c_blk_frag_shift;
++    sbi->off_inode_tbl = sb->off_inode_tbl >> sb->c_blk_frag_shift;
++    sbi->c_blk_frag_shift = sb->c_blk_frag_shift;
++    sbi->fs_type = ufs_type;
++
++    return sbi;
++}
++
++/*
++ * Init the fs metadata and return block size
++ */
++static int ufs_fs_init(struct fs_info *fs)
++{
++    struct disk *disk = fs->fs_dev->disk;
++    struct ufs_super_block sb;
++    struct cache *cs;
++
++    int ufs_type = ufs_checksb(&sb, disk);
++    if (ufs_type == NONE)
++	return -1;
++
++    ufs_debug("%s SB FOUND!\n", ufs_type == UFS1 ? "UFS1" : "UFS2");
++    ufs_debug("Block size: %u\n", sb.block_size);
++
++    fs->fs_info = (struct ufs_sb_info *) set_ufs_info(&sb, ufs_type);
++    fs->sector_shift = disk->sector_shift;
++    fs->sector_size  = disk->sector_size;
++    fs->block_shift  = sb.block_shift;
++    fs->block_size   = sb.block_size;
++
++    /* Initialize the cache, and force a clean on block zero */
++    cache_init(fs->fs_dev, sb.block_shift);
++    cs = _get_cache_block(fs->fs_dev, 0);
++    memset(cs->data, 0, fs->block_size);
++    cache_lock_block(cs);
++
++    /* For debug purposes */
++    //ufs_checking(fs);
++
++    //return -1;
++    return fs->block_shift;
++}
++
++const struct fs_ops ufs_fs_ops = {
++    .fs_name        = "ufs",
++    .fs_flags       = FS_USEMEM | FS_THISIND,
++    .fs_init        = ufs_fs_init,
++    .searchdir      = NULL,
++    .getfssec       = generic_getfssec,
++    .close_file     = generic_close_file,
++    .mangle_name    = generic_mangle_name,
++    .open_config    = generic_open_config,
++    .readlink	    = NULL,
++    .readdir        = ufs_readdir,
++    .iget_root      = ufs_iget_root,
++    .iget           = ufs_iget,
++    .next_extent    = ufs_next_extent,
++};
+diff --git a/core/fs/ufs/ufs.h b/core/fs/ufs/ufs.h
+new file mode 100644
+index 0000000..fd7f665
+--- /dev/null
++++ b/core/fs/ufs/ufs.h
+@@ -0,0 +1,253 @@
++/*
++ * Copyright (C) 2013 Raphael S. Carvalho <raphael.scarv@gmail.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the
++ * Free Software Foundation, Inc.,
++ * 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
++*/
++
++#ifndef _UFS_H_
++#define _UFS_H_
++
++#include <stdint.h>
++
++/* Sector addresses */
++#define UFS1_SBLOCK_OFFSET	8192
++#define UFS2_SBLOCK_OFFSET	65536
++#define UFS2_SBLOCK2_OFFSET	262144
++
++#define UFS1_ADDR_SHIFT 2
++#define UFS2_ADDR_SHIFT 3
++
++/* Super magic numbers */
++#define UFS1_SUPER_MAGIC	(0x011954)
++#define UFS2_SUPER_MAGIC	(0x19540119)
++
++#define UFS_ROOT_INODE 2
++
++#define UFS_DIRECT_BLOCKS 12
++#define UFS_INDIRECT_BLOCK 1
++#define UFS_DOUBLE_INDIRECT_BLOCK 1
++#define UFS_TRIPLE_INDIRECT_BLOCK 1
++/* Total number of block addr hold by inodes */
++#define UFS_NBLOCKS 15
++
++/* Blocks span 8 fragments */
++#define FRAGMENTS_PER_BLK 8
++
++/* UFS types */
++typedef enum {
++    NONE,
++    UFS1,
++    UFS2,
++    UFS2_PIGGY,
++} ufs_t;
++
++/*
++ * UFS1/UFS2 SUPERBLOCK structure
++ * CG stands for Cylinder Group.
++ *
++ * Variables prepended with off store offsets relative to
++ * base address of a Cylinder Group (CG).
++ */
++struct ufs_super_block { // supporting either ufs1 or ufs2
++    uint8_t  unused[8];
++    /* Offset values */
++    uint32_t off_backup_sb; // Backup super block
++    uint32_t off_group_desc; // Group Descriptor
++    uint32_t off_inode_tbl; // Inode table
++    uint32_t off_data_block; // First data block
++    union {
++	struct {  /* Used for UFS1 */
++	    uint32_t delta_value; // For calc staggering offset
++	    uint32_t cycle_mask; // Mask for staggering offset
++	    uint32_t last_written; // Last written time
++	    uint32_t nr_frags; // Number of frags in FS
++	    uint32_t storable_frags_nr; // Nr of frags that can store data
++	} ufs1;
++	uint8_t unused1[20];
++    };
++    uint32_t nr_cyl_groups; // Number of cylinder groups.
++    uint32_t block_size; // Block size in bytes.
++    uint32_t fragment_size; // Fragment size in bytes.
++    uint8_t  unused2[16];
++    uint32_t block_addr_mask; // to calculate the address
++    uint32_t frag_addr_mask;
++    uint32_t block_shift; // to calculate byte address
++    uint32_t frag_shift;
++    uint32_t nr_contiguous_blk; // max number of continuous blks to alloc
++    uint32_t nr_blks_per_cg; // max number of blks per cylinder group
++    uint32_t c_blk_frag_shift; // Bits to convert blk and frag address.
++    uint32_t c_frag_sect_shift; // Bits to convert frag and sect address.
++    uint32_t superblk_size; // Superblock size.
++    uint8_t  unused3[76];
++    uint32_t inodes_per_cg; // Inodes per cylinder group
++    uint32_t frags_per_cg; // Fragments per cylinder group
++    union {
++	struct { /* Used for UFS2 */
++	    uint8_t  unused[888];
++	    uint64_t nr_frags; // Number of fragments in FS
++	    uint8_t  unused1[232];
++	} ufs2;
++	uint8_t unused4[1128];
++    };
++    uint32_t maxlen_isymlink; // Max length of internal symlink
++    uint32_t inodes_format; // Format of inodes
++    uint8_t  unused5[44];
++    uint32_t magic; // Magic value
++    uint8_t  pad[160]; // padding up to sector (512 bytes) boundary
++} __attribute__((__packed__));
++
++/*
++ * Info about UFS1/2 super block.
++ */
++struct ufs_sb_info {
++    uint32_t blocks_per_cg; // Blocks per cylinder group
++    uint32_t inodes_per_cg; // Inodes per cylinder group
++    uint32_t inode_size;
++    uint32_t inodes_per_block; // Inodes per block
++    struct { /* UFS1 only! */
++	/* Values for calculating staggering offset */
++	uint32_t delta_value;
++	uint32_t cycle_mask;
++    } ufs1;
++    uint32_t off_inode_tbl; // Inode table offset.
++    uint32_t groups_count; // Number of groups in the fs
++    uint32_t addr_shift; // 2 ^ addr_shift = size in bytes of default addr.
++    uint32_t c_blk_frag_shift; // Convert blk/frag addr (vice-versa)
++    struct   inode *(*ufs_iget_by_inr)(struct fs_info *, uint32_t);
++    ufs_t    fs_type; // { UFS1, UFS2, UFS2_PIGGY }
++};
++
++/*
++ * Get super block info struct
++ */
++static inline struct ufs_sb_info *UFS_SB(struct fs_info *fs)
++{
++    return fs->fs_info;
++}
++
++/*
++ * Convert frag addr to blk addr
++ */
++static inline block_t frag_to_blk(struct fs_info *fs, uint64_t frag)
++{
++    return frag >> UFS_SB(fs)->c_blk_frag_shift;
++}
++
++/*
++ * UFS1 inode structures
++ */
++struct ufs1_inode {
++    uint16_t file_mode;
++    uint16_t link_count;
++    uint8_t  unused[4];
++    uint64_t size;
++    uint32_t a_time; // Access time
++    uint32_t a_time_nanosec;
++    uint32_t m_time; // Modified time
++    uint32_t m_time_nanosec;
++    uint32_t ch_time; // Change time
++    uint32_t ch_time_nanosec;
++    uint32_t direct_blk_ptr[12];
++    uint32_t indirect_blk_ptr;
++    uint32_t double_indirect_blk_ptr;
++    uint32_t triple_indirect_blk_ptr;
++    uint32_t flags; // Status flags
++    uint32_t blocks_held; // Blocks held
++    uint32_t generation_nrb; // (NFS)
++    uint32_t used_id;
++    uint32_t group_id;
++    uint8_t  unused1[8];
++} __attribute__((__packed__));
++
++/*
++ * UFS2 inode structures
++ */
++struct ufs2_inode {
++    uint16_t file_mode;
++    uint16_t link_count;
++    uint32_t user_id;
++    uint32_t group_id;
++    uint32_t inode_blocksize;
++    uint64_t size;
++    uint64_t bytes_held;
++    uint64_t a_time; // Access time
++    uint64_t m_time; // Modified time
++    uint64_t ch_time; // Change time
++    uint64_t creat_time; // Creation time
++    uint32_t a_time_nanosec;
++    uint32_t m_time_nanosec;
++    uint32_t ch_time_nanosec;
++    uint32_t creat_time_nanosec;
++    uint32_t generation_nrb; // (NFS)
++    uint32_t kernel_flags;
++    uint32_t flags;
++    uint32_t ext_attr_size; // Extended attrib size.
++    uint64_t ext_direct_blk_ptrs[2]; // Ext. attrib blk pointers.
++    uint64_t direct_blk_ptr[12];
++    uint64_t indirect_blk_ptr;
++    uint64_t double_indirect_blk_ptr;
++    uint64_t triple_indirect_blk_ptr;
++    uint8_t  unused[24];
++} __attribute__((__packed__));
++
++#define PVT(p) ((struct ufs_inode_pvt *) p->pvt)
++struct ufs_inode_pvt {
++    uint64_t direct_blk_ptr[12];
++    uint64_t indirect_blk_ptr;
++    uint64_t double_indirect_blk_ptr;
++    uint64_t triple_indirect_blk_ptr;
++};
++
++struct ufs_dir_entry {
++    uint32_t inode_value;
++    uint16_t dir_entry_len;
++    uint8_t  name_length;
++    uint8_t  file_type;
++    uint8_t  name[1]; // Dir names are null terminated!!!
++};
++
++enum inode_type_flags {
++    UFS_INO_FIFO	= 0x1000,
++    UFS_INO_CHARDEV	= 0x2000,
++    UFS_INO_DIRECTORY 	= 0x4000,
++    UFS_INO_BLOCKDEV	= 0x6000,
++    UFS_INO_RFILE	= 0x8000,
++    UFS_INO_SYMLINK	= 0xA000,
++    UFS_INO_UNIXSOCKET 	= 0xC000,
++};
++
++enum dir_type_flags {
++    UFS_DTYPE_UNKNOWN	= 0,
++    UFS_DTYPE_FIFO 	= 1,
++    UFS_DTYPE_CHARDEV	= 2,
++    // FIXME: 3 seems to be a valid type for directories.
++    UFS_DTYPE_DIR 	= 4 | 3,
++    UFS_DTYPE_BLOCK	= 6,
++    // FIXME: block_device (6) seems to be a valid type for regular files.
++    UFS_DTYPE_RFILE	= 8 | 6,
++    UFS_DTYPE_SYMLINK 	= 10,
++    UFS_DTYPE_SOCKET	= 12,
++    UFS_DTYPE_WHITEOUT 	= 14,
++};
++
++/* Functions from bmap.c */
++extern uint64_t ufs_bmap (struct inode *, block_t, size_t *);
++extern int ufs_next_extent(struct inode *, uint32_t);
++
++#define ufs_debug dprintf
++//extern void ufs_checking (struct fs_info *);
++
++#endif /* _UFS_H_ */
+diff --git a/core/ldlinux.asm b/core/ldlinux.asm
+index a1f96b7..050f503 100644
+--- a/core/ldlinux.asm
++++ b/core/ldlinux.asm
+@@ -43,6 +43,8 @@ ROOT_FS_OPS:
+ 		dd xfs_fs_ops
+ 		extern btrfs_fs_ops
+ 		dd btrfs_fs_ops
++		extern ufs_fs_ops
++		dd ufs_fs_ops
+ 		dd 0
+ 
+ %include "diskfs.inc"
+-- 
+1.7.2.5
+
