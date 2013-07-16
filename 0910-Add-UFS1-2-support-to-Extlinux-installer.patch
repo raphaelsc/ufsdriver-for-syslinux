@@ -1,0 +1,582 @@
+From 7c5b6965f4dd807e66adf20953e3674f2c3984dd Mon Sep 17 00:00:00 2001
+From: Raphael S.Carvalho <raphael.scarv@gmail.com>
+Date: Fri, 12 Jul 2013 20:25:33 -0300
+Subject: [PATCH 910/911] Add UFS1/2 support to Extlinux installer.
+
+It's needed to enumerate both UFS1/2 since they have different magic numbers
+and super block offsets.
+Besides, UFS2 can be installed in the 0-64k range like BTRFS, whereas
+UFS1 can't.
+
+Signed-off-by: Raphael S.Carvalho <raphael.scarv@gmail.com>
+---
+ extlinux/main.c        |   71 +++++++++---
+ extlinux/ufs.h         |   26 ++++
+ extlinux/ufs_fs.h      |  307 ++++++++++++++++++++++++++++++++++++++++++++++++
+ libinstaller/syslxfs.h |    4 +-
+ 4 files changed, 390 insertions(+), 18 deletions(-)
+ create mode 100644 extlinux/ufs.h
+ create mode 100644 extlinux/ufs_fs.h
+
+diff --git a/extlinux/main.c b/extlinux/main.c
+index aa20e1b..1ebf800 100644
+--- a/extlinux/main.c
++++ b/extlinux/main.c
+@@ -14,8 +14,8 @@
+ /*
+  * extlinux.c
+  *
+- * Install the syslinux boot block on an fat, ntfs, ext2/3/4, btrfs and xfs
+- * filesystem.
++ * Install the syslinux boot block on an fat, ntfs, ext2/3/4, btrfs, xfs,
++ * and ufs1/2 filesystem.
+  */
+ 
+ #define  _GNU_SOURCE		/* Enable everything */
+@@ -50,6 +50,8 @@
+ #include "xfs.h"
+ #include "xfs_types.h"
+ #include "xfs_sb.h"
++#include "ufs.h"
++#include "ufs_fs.h"
+ #include "misc.h"
+ #include "../version.h"
+ #include "syslxint.h"
+@@ -76,8 +78,10 @@
+ #define XFS_BOOTSECT_OFFSET	(4 << SECTOR_SHIFT)
+ #define XFS_SUPPORTED_BLOCKSIZE 4096 /* 4 KiB filesystem block size */
+ 
+-/* the btrfs partition first 64K blank area is used to store boot sector and
+-   boot image, the boot sector is from 0~512, the boot image starts after */
++/*
++ * the btrfs/ufs2 partition first 64K blank area is used to store boot sector
++ * and boot image, the boot sector is from 0~512, the boot image starts after
++ */
+ #define BTRFS_BOOTSECT_AREA	65536
+ #define BTRFS_EXTLINUX_OFFSET	SECTOR_SIZE
+ #define BTRFS_SUBVOL_MAX 256	/* By btrfs specification */
+@@ -308,12 +312,12 @@ static int patch_file_and_bootblock(int fd, const char *dir, int devfd)
+     nsect += 2;			/* Two sectors for the ADV */
+     sectp = alloca(sizeof(sector_t) * nsect);
+     if (fs_type == EXT2 || fs_type == VFAT || fs_type == NTFS ||
+-	fs_type == XFS) {
++	fs_type == XFS || fs_type == UFS1) {
+ 	if (sectmap(fd, sectp, nsect)) {
+ 		perror("bmap");
+ 		exit(1);
+ 	}
+-    } else if (fs_type == BTRFS) {
++    } else if (fs_type == BTRFS || fs_type == UFS2) {
+ 	int i;
+ 	sector_t *sp = sectp;
+ 
+@@ -342,6 +346,7 @@ int install_bootblock(int fd, const char *device)
+     struct fat_boot_sector sb3;
+     struct ntfs_boot_sector sb4;
+     xfs_sb_t sb5;
++    struct ufs_super_block sb6;
+     bool ok = false;
+ 
+     if (fs_type == EXT2) {
+@@ -395,11 +400,25 @@ int install_bootblock(int fd, const char *device)
+ 
+ 	    ok = true;
+ 	}
++    } else if (fs_type == UFS1 || fs_type == UFS2) {
++	uint32_t sblock_off = (fs_type == UFS1) ?
++	    SBLOCK_UFS1 : SBLOCK_UFS2;
++	uint32_t ufs_smagic = (fs_type == UFS1) ?
++	    UFS1_SUPER_MAGIC : UFS2_SUPER_MAGIC;
++
++	if (xpread(fd, &sb6, sizeof sb6, sblock_off) != sizeof sb6) {
++		perror("reading superblock");
++		return 1;
++	}
++
++	if (sb6.fs_magic == ufs_smagic)
++		ok = true;
+     }
+ 
+     if (!ok) {
+ 	fprintf(stderr,
+-		"no fat, ntfs, ext2/3/4, btrfs or xfs superblock found on %s\n",
++		"no fat, ntfs, ext2/3/4, btrfs, xfs "
++		"or ufs1/2 superblock found on %s\n",
+ 		device);
+ 	return 1;
+     }
+@@ -575,7 +594,7 @@ bail:
+     return 1;
+ }
+ 
+-/* btrfs has to install the ldlinux.sys in the first 64K blank area, which
++/* btrfs/ufs2 has to install the ldlinux.sys in the first 64K blank area, which
+    is not managered by btrfs tree, so actually this is not installed as files.
+    since the cow feature of btrfs will move the ldlinux.sys every where */
+ int btrfs_install_file(const char *path, int devfd, struct stat *rst)
+@@ -955,9 +974,10 @@ static char * get_default_subvol(char * rootdir, char * subvol)
+ 
+ static int install_file(const char *path, int devfd, struct stat *rst)
+ {
+-    if (fs_type == EXT2 || fs_type == VFAT || fs_type == NTFS)
++    if (fs_type == EXT2 || fs_type == VFAT || fs_type == NTFS
++	|| fs_type == UFS1)
+ 	return ext2_fat_install_file(path, devfd, rst);
+-    else if (fs_type == BTRFS)
++    else if (fs_type == BTRFS || fs_type == UFS2)
+ 	return btrfs_install_file(path, devfd, rst);
+     else if (fs_type == XFS)
+ 	return xfs_install_file(path, devfd, rst);
+@@ -983,7 +1003,7 @@ static int validate_device(const char *path, int devfd)
+     struct statfs sfs;
+     int pfd;
+     int rv = -1;
+-    
++
+     pfd = open(path, O_RDONLY|O_DIRECTORY);
+     if (pfd < 0)
+ 	goto err;
+@@ -1063,6 +1083,17 @@ static const char *find_device(const char *mtab_file, dev_t dev)
+ 		done = true;
+ 		break;
+ 	    }
++
++	    break;
++	case UFS1:
++	case UFS2:
++	    if (!strcmp(mnt->mnt_type, "ufs") && !stat(mnt->mnt_fsname, &dst) &&
++		dst.st_rdev == dev) {
++		done = true;
++		break;
++	    }
++
++	    break;
+ 	case NONE:
+ 	    break;
+ 	}
+@@ -1187,7 +1218,7 @@ static int validate_device_btrfs(int pfd, int dfd)
+ 	return -1;
+ 
+     return 0;			/* It's good! */
+-}    
++}
+ 
+ static const char *find_device_btrfs(const char *path)
+ {
+@@ -1276,7 +1307,7 @@ static const char *get_devname(const char *path)
+ 	    fprintf(stderr, "%s: cannot create device %s\n", program, devname);
+ 	    return devname;
+ 	}
+-	
++
+ 	atexit(device_cleanup);	/* unlink the device node on exit */
+ 	devname = devname_buf;
+     }
+@@ -1330,10 +1361,15 @@ static int open_device(const char *path, struct stat *st, const char **_devname)
+ 	fs_type = NTFS;
+     else if (sfs.f_type == XFS_SUPER_MAGIC)
+ 	fs_type = XFS;
++    else if (sfs.f_type == UFS1_SUPER_MAGIC)
++	fs_type = UFS1;
++    else if (sfs.f_type == UFS2_SUPER_MAGIC)
++	fs_type = UFS2;
+ 
+     if (!fs_type) {
+ 	fprintf(stderr,
+-		"%s: not a fat, ntfs, ext2/3/4, btrfs or xfs filesystem: %s\n",
++		"%s: not a fat, ntfs, ext2/3/4, btrfs, xfs or"
++		"ufs1/2 filesystem: %s\n",
+ 		program, path);
+ 	return -1;
+     }
+@@ -1382,8 +1418,8 @@ static int ext_read_adv(const char *path, int devfd, const char **namep)
+     int err;
+     const char *name;
+ 
+-    if (fs_type == BTRFS) {
+-	/* btrfs "ldlinux.sys" is in 64k blank area */
++    if (fs_type == BTRFS || fs_type == UFS2) {
++	/* btrfs/ufs2 "ldlinux.sys" is in 64k blank area */
+ 	return btrfs_read_adv(devfd);
+     } else if (fs_type == XFS) {
+ 	/* XFS "ldlinux.sys" is in the first 2048 bytes of the primary AG */
+@@ -1400,7 +1436,8 @@ static int ext_read_adv(const char *path, int devfd, const char **namep)
+ 
+ static int ext_write_adv(const char *path, const char *cfg, int devfd)
+ {
+-    if (fs_type == BTRFS) { /* btrfs "ldlinux.sys" is in 64k blank area */
++    /* btrfs/ufs2 "ldlinux.sys" is in 64k blank area */
++    if (fs_type == BTRFS || fs_type == UFS2) {
+ 	if (xpwrite(devfd, syslinux_adv, 2 * ADV_SIZE,
+ 		BTRFS_ADV_OFFSET) != 2 * ADV_SIZE) {
+ 		perror("writing adv");
+diff --git a/extlinux/ufs.h b/extlinux/ufs.h
+new file mode 100644
+index 0000000..d324699
+--- /dev/null
++++ b/extlinux/ufs.h
+@@ -0,0 +1,26 @@
++/*
++ * Copyright (c) 2013 Raphael S. Carvalho <raphael.scarv@gmail.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the
++ * Free Software Foundation, Inc.,
++ * 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
++*/
++
++#ifndef UFS_H_
++#define UFS_H_
++
++#define UFS1_SUPER_MAGIC 0x00011954
++#define UFS2_SUPER_MAGIC 0x19540119
++
++#endif /* UFS_H_ */
+diff --git a/extlinux/ufs_fs.h b/extlinux/ufs_fs.h
+new file mode 100644
+index 0000000..ff8a4e7
+--- /dev/null
++++ b/extlinux/ufs_fs.h
+@@ -0,0 +1,307 @@
++/*
++ * Taken from Linux kernel tree (linux/fs/ufs)
++ * linux/include/linux/ufs_fs.h
++ *
++ * Copyright (C) 1996
++ * Adrian Rodriguez (adrian@franklins-tower.rutgers.edu)
++ * Laboratory for Computer Science Research Computing Facility
++ * Rutgers, The State University of New Jersey
++ *
++ * Copyright (c) 2013 Raphael S. Carvalho <raphael.scarv@gmail.com>
++ *
++ * Clean swab support by Fare <fare@tunes.org>
++ * just hope no one is using NNUUXXI on __?64 structure elements
++ * 64-bit clean thanks to Maciej W. Rozycki <macro@ds2.pg.gda.pl>
++ *
++ * 4.4BSD (FreeBSD) support added on February 1st 1998 by
++ * Niels Kristian Bech Jensen <nkbj@image.dk> partially based
++ * on code by Martin von Loewis <martin@mira.isdn.cs.tu-berlin.de>.
++ *
++ * NeXTstep support added on February 5th 1998 by
++ * Niels Kristian Bech Jensen <nkbj@image.dk>.
++ *
++ * Write support by Daniel Pirkl <daniel.pirkl@email.cz>
++ *
++ * HP/UX hfs filesystem support added by
++ * Martin K. Petersen <mkp@mkp.net>, August 1999
++ *
++ * UFS2 (of FreeBSD 5.x) support added by
++ * Niraj Kumar <niraj17@iitbombay.org>  , Jan 2004
++ *
++ */
++
++#ifndef __LINUX_UFS_FS_H
++#define __LINUX_UFS_FS_H
++
++#include <inttypes.h>
++
++typedef uint64_t __fs64;
++typedef uint32_t __fs32;
++typedef uint16_t __fs16;
++
++#define UFS_BBLOCK 0
++#define UFS_BBSIZE 8192
++#define UFS_SBLOCK 8192
++#define UFS_SBSIZE 8192
++
++#define UFS_SECTOR_SIZE 512
++#define UFS_SECTOR_BITS 9
++#define UFS_MAGIC  0x00011954
++#define UFS_MAGIC_BW 0x0f242697
++#define UFS2_MAGIC 0x19540119
++#define UFS_CIGAM  0x54190100 /* byteswapped MAGIC */
++
++/* Copied from FreeBSD */
++/*
++ * Each disk drive contains some number of filesystems.
++ * A filesystem consists of a number of cylinder groups.
++ * Each cylinder group has inodes and data.
++ *
++ * A filesystem is described by its super-block, which in turn
++ * describes the cylinder groups.  The super-block is critical
++ * data and is replicated in each cylinder group to protect against
++ * catastrophic loss.  This is done at `newfs' time and the critical
++ * super-block data does not change, so the copies need not be
++ * referenced further unless disaster strikes.
++ *
++ * For filesystem fs, the offsets of the various blocks of interest
++ * are given in the super block as:
++ *      [fs->fs_sblkno]         Super-block
++ *      [fs->fs_cblkno]         Cylinder group block
++ *      [fs->fs_iblkno]         Inode blocks
++ *      [fs->fs_dblkno]         Data blocks
++ * The beginning of cylinder group cg in fs, is given by
++ * the ``cgbase(fs, cg)'' macro.
++ *
++ * Depending on the architecture and the media, the superblock may
++ * reside in any one of four places. For tiny media where every block
++ * counts, it is placed at the very front of the partition. Historically,
++ * UFS1 placed it 8K from the front to leave room for the disk label and
++ * a small bootstrap. For UFS2 it got moved to 64K from the front to leave
++ * room for the disk label and a bigger bootstrap, and for really piggy
++ * systems we check at 256K from the front if the first three fail. In
++ * all cases the size of the superblock will be SBLOCKSIZE. All values are
++ * given in byte-offset form, so they do not imply a sector size. The
++ * SBLOCKSEARCH specifies the order in which the locations should be searched.
++ */
++#define SBLOCK_FLOPPY        0
++#define SBLOCK_UFS1       8192
++#define SBLOCK_UFS2      65536
++#define SBLOCK_PIGGY    262144
++#define SBLOCKSIZE        8192
++#define SBLOCKSEARCH \
++        { SBLOCK_UFS2, SBLOCK_UFS1, SBLOCK_FLOPPY, SBLOCK_PIGGY, -1 }
++
++#define	UFS_MAXNAMLEN 255
++#define UFS_MAXMNTLEN 512
++#define UFS2_MAXMNTLEN 468
++#define UFS2_MAXVOLLEN 32
++#define UFS_MAXCSBUFS 31
++#define UFS_LINK_MAX 32000
++/*
++#define	UFS2_NOCSPTRS	((128 / sizeof(void *)) - 4)
++*/
++#define	UFS2_NOCSPTRS	28
++
++/*
++ * UFS_DIR_PAD defines the directory entries boundaries
++ * (must be a multiple of 4)
++ */
++#define UFS_DIR_PAD			4
++#define UFS_DIR_ROUND			(UFS_DIR_PAD - 1)
++#define UFS_DIR_REC_LEN(name_len)	(((name_len) + 1 + 8 + UFS_DIR_ROUND) & ~UFS_DIR_ROUND)
++
++struct ufs_timeval {
++	__fs32	tv_sec;
++	__fs32	tv_usec;
++};
++
++struct ufs_dir_entry {
++	__fs32  d_ino;			/* inode number of this entry */
++	__fs16  d_reclen;		/* length of this entry */
++	union {
++		__fs16	d_namlen;		/* actual length of d_name */
++		struct {
++			__u8	d_type;		/* file type */
++			__u8	d_namlen;	/* length of string in d_name */
++		} d_44;
++	} d_u;
++	__u8	d_name[UFS_MAXNAMLEN + 1];	/* file name */
++};
++
++struct ufs_csum {
++	__fs32	cs_ndir;	/* number of directories */
++	__fs32	cs_nbfree;	/* number of free blocks */
++	__fs32	cs_nifree;	/* number of free inodes */
++	__fs32	cs_nffree;	/* number of free frags */
++};
++struct ufs2_csum_total {
++	__fs64	cs_ndir;	/* number of directories */
++	__fs64	cs_nbfree;	/* number of free blocks */
++	__fs64	cs_nifree;	/* number of free inodes */
++	__fs64	cs_nffree;	/* number of free frags */
++	__fs64   cs_numclusters;	/* number of free clusters */
++	__fs64   cs_spare[3];	/* future expansion */
++};
++
++struct ufs_csum_core {
++	__u64	cs_ndir;	/* number of directories */
++	__u64	cs_nbfree;	/* number of free blocks */
++	__u64	cs_nifree;	/* number of free inodes */
++	__u64	cs_nffree;	/* number of free frags */
++	__u64   cs_numclusters;	/* number of free clusters */
++};
++
++struct ufs_super_block {
++	union {
++		struct {
++			__fs32	fs_link;	/* UNUSED */
++		} fs_42;
++		struct {
++			__fs32	fs_state;	/* file system state flag */
++		} fs_sun;
++	} fs_u0;
++	__fs32	fs_rlink;	/* UNUSED */
++	__fs32	fs_sblkno;	/* addr of super-block in filesys */
++	__fs32	fs_cblkno;	/* offset of cyl-block in filesys */
++	__fs32	fs_iblkno;	/* offset of inode-blocks in filesys */
++	__fs32	fs_dblkno;	/* offset of first data after cg */
++	__fs32	fs_cgoffset;	/* cylinder group offset in cylinder */
++	__fs32	fs_cgmask;	/* used to calc mod fs_ntrak */
++	__fs32	fs_time;	/* last time written -- time_t */
++	__fs32	fs_size;	/* number of blocks in fs */
++	__fs32	fs_dsize;	/* number of data blocks in fs */
++	__fs32	fs_ncg;		/* number of cylinder groups */
++	__fs32	fs_bsize;	/* size of basic blocks in fs */
++	__fs32	fs_fsize;	/* size of frag blocks in fs */
++	__fs32	fs_frag;	/* number of frags in a block in fs */
++/* these are configuration parameters */
++	__fs32	fs_minfree;	/* minimum percentage of free blocks */
++	__fs32	fs_rotdelay;	/* num of ms for optimal next block */
++	__fs32	fs_rps;		/* disk revolutions per second */
++/* these fields can be computed from the others */
++	__fs32	fs_bmask;	/* ``blkoff'' calc of blk offsets */
++	__fs32	fs_fmask;	/* ``fragoff'' calc of frag offsets */
++	__fs32	fs_bshift;	/* ``lblkno'' calc of logical blkno */
++	__fs32	fs_fshift;	/* ``numfrags'' calc number of frags */
++/* these are configuration parameters */
++	__fs32	fs_maxcontig;	/* max number of contiguous blks */
++	__fs32	fs_maxbpg;	/* max number of blks per cyl group */
++/* these fields can be computed from the others */
++	__fs32	fs_fragshift;	/* block to frag shift */
++	__fs32	fs_fsbtodb;	/* fsbtodb and dbtofsb shift constant */
++	__fs32	fs_sbsize;	/* actual size of super block */
++	__fs32	fs_csmask;	/* csum block offset */
++	__fs32	fs_csshift;	/* csum block number */
++	__fs32	fs_nindir;	/* value of NINDIR */
++	__fs32	fs_inopb;	/* value of INOPB */
++	__fs32	fs_nspf;	/* value of NSPF */
++/* yet another configuration parameter */
++	__fs32	fs_optim;	/* optimization preference, see below */
++/* these fields are derived from the hardware */
++	union {
++		struct {
++			__fs32	fs_npsect;	/* # sectors/track including spares */
++		} fs_sun;
++		struct {
++			__fs32	fs_state;	/* file system state time stamp */
++		} fs_sunx86;
++	} fs_u1;
++	__fs32	fs_interleave;	/* hardware sector interleave */
++	__fs32	fs_trackskew;	/* sector 0 skew, per track */
++/* a unique id for this filesystem (currently unused and unmaintained) */
++/* In 4.3 Tahoe this space is used by fs_headswitch and fs_trkseek */
++/* Neither of those fields is used in the Tahoe code right now but */
++/* there could be problems if they are.                            */
++	__fs32	fs_id[2];	/* file system id */
++/* sizes determined by number of cylinder groups and their sizes */
++	__fs32	fs_csaddr;	/* blk addr of cyl grp summary area */
++	__fs32	fs_cssize;	/* size of cyl grp summary area */
++	__fs32	fs_cgsize;	/* cylinder group size */
++/* these fields are derived from the hardware */
++	__fs32	fs_ntrak;	/* tracks per cylinder */
++	__fs32	fs_nsect;	/* sectors per track */
++	__fs32	fs_spc;		/* sectors per cylinder */
++/* this comes from the disk driver partitioning */
++	__fs32	fs_ncyl;	/* cylinders in file system */
++/* these fields can be computed from the others */
++	__fs32	fs_cpg;		/* cylinders per group */
++	__fs32	fs_ipg;		/* inodes per cylinder group */
++	__fs32	fs_fpg;		/* blocks per group * fs_frag */
++/* this data must be re-computed after crashes */
++	struct ufs_csum fs_cstotal;	/* cylinder summary information */
++/* these fields are cleared at mount time */
++	__s8	fs_fmod;	/* super block modified flag */
++	__s8	fs_clean;	/* file system is clean flag */
++	__s8	fs_ronly;	/* mounted read-only flag */
++	__s8	fs_flags;
++	union {
++		struct {
++			__s8	fs_fsmnt[UFS_MAXMNTLEN];/* name mounted on */
++			__fs32	fs_cgrotor;	/* last cg searched */
++			__fs32	fs_csp[UFS_MAXCSBUFS];/*list of fs_cs info buffers */
++			__fs32	fs_maxcluster;
++			__fs32	fs_cpc;		/* cyl per cycle in postbl */
++			__fs16	fs_opostbl[16][8]; /* old rotation block list head */
++		} fs_u1;
++		struct {
++			__s8  fs_fsmnt[UFS2_MAXMNTLEN];	/* name mounted on */
++			__u8   fs_volname[UFS2_MAXVOLLEN]; /* volume name */
++			__fs64  fs_swuid;		/* system-wide uid */
++			__fs32  fs_pad;	/* due to alignment of fs_swuid */
++			__fs32   fs_cgrotor;     /* last cg searched */
++			__fs32   fs_ocsp[UFS2_NOCSPTRS]; /*list of fs_cs info buffers */
++			__fs32   fs_contigdirs;/*# of contiguously allocated dirs */
++			__fs32   fs_csp;	/* cg summary info buffer for fs_cs */
++			__fs32   fs_maxcluster;
++			__fs32   fs_active;/* used by snapshots to track fs */
++			__fs32   fs_old_cpc;	/* cyl per cycle in postbl */
++			__fs32   fs_maxbsize;/*maximum blocking factor permitted */
++			__fs64   fs_sparecon64[17];/*old rotation block list head */
++			__fs64   fs_sblockloc; /* byte offset of standard superblock */
++			struct  ufs2_csum_total fs_cstotal;/*cylinder summary information*/
++			struct  ufs_timeval    fs_time;		/* last time written */
++			__fs64    fs_size;		/* number of blocks in fs */
++			__fs64    fs_dsize;	/* number of data blocks in fs */
++			__fs64   fs_csaddr;	/* blk addr of cyl grp summary area */
++			__fs64    fs_pendingblocks;/* blocks in process of being freed */
++			__fs32    fs_pendinginodes;/*inodes in process of being freed */
++		} fs_u2;
++	}  fs_u11;
++	union {
++		struct {
++			__fs32	fs_sparecon[53];/* reserved for future constants */
++			__fs32	fs_reclaim;
++			__fs32	fs_sparecon2[1];
++			__fs32	fs_state;	/* file system state time stamp */
++			__fs32	fs_qbmask[2];	/* ~usb_bmask */
++			__fs32	fs_qfmask[2];	/* ~usb_fmask */
++		} fs_sun;
++		struct {
++			__fs32	fs_sparecon[53];/* reserved for future constants */
++			__fs32	fs_reclaim;
++			__fs32	fs_sparecon2[1];
++			__fs32	fs_npsect;	/* # sectors/track including spares */
++			__fs32	fs_qbmask[2];	/* ~usb_bmask */
++			__fs32	fs_qfmask[2];	/* ~usb_fmask */
++		} fs_sunx86;
++		struct {
++			__fs32	fs_sparecon[50];/* reserved for future constants */
++			__fs32	fs_contigsumsize;/* size of cluster summary array */
++			__fs32	fs_maxsymlinklen;/* max length of an internal symlink */
++			__fs32	fs_inodefmt;	/* format of on-disk inodes */
++			__fs32	fs_maxfilesize[2];	/* max representable file size */
++			__fs32	fs_qbmask[2];	/* ~usb_bmask */
++			__fs32	fs_qfmask[2];	/* ~usb_fmask */
++			__fs32	fs_state;	/* file system state time stamp */
++		} fs_44;
++	} fs_u2;
++	__fs32	fs_postblformat;	/* format of positional layout tables */
++	__fs32	fs_nrpos;		/* number of rotational positions */
++	__fs32	fs_postbloff;		/* (__s16) rotation block list head */
++	__fs32	fs_rotbloff;		/* (__u8) blocks for each rotation */
++	__fs32	fs_magic;		/* magic number */
++	__u8	fs_space[1];		/* list of blocks for each rotation */
++}; /*struct ufs_super_block*/
++
++#endif
+diff --git a/libinstaller/syslxfs.h b/libinstaller/syslxfs.h
+index 4d8f3b2..7e46e23 100644
+--- a/libinstaller/syslxfs.h
++++ b/libinstaller/syslxfs.h
+@@ -12,7 +12,7 @@
+ #ifndef _SYSLXFS_H_
+ #define _SYSLXFS_H_
+ 
+-/* Global fs_type for handling fat, ntfs, ext2/3/4, btrfs and xfs */
++/* Global fs_type for handling fat, ntfs, ext2/3/4, btrfs, xfs and ufs1/2 */
+ enum filesystem {
+     NONE,
+     EXT2,
+@@ -20,6 +20,8 @@ enum filesystem {
+     VFAT,
+     NTFS,
+     XFS,
++    UFS1,
++    UFS2,
+ };
+ 
+ extern int fs_type;
+-- 
+1.7.2.5
+
