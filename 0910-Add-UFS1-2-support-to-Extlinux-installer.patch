@@ -1,25 +1,25 @@
-From 7c5b6965f4dd807e66adf20953e3674f2c3984dd Mon Sep 17 00:00:00 2001
+From fedc29b1351f96b3445111884e6cbf5b74abe6c7 Mon Sep 17 00:00:00 2001
 From: Raphael S.Carvalho <raphael.scarv@gmail.com>
-Date: Fri, 12 Jul 2013 20:25:33 -0300
-Subject: [PATCH 910/911] Add UFS1/2 support to Extlinux installer.
+Date: Sun, 21 Jul 2013 22:58:27 -0300
+Subject: [PATCH 1/1 v2] Add UFS1/2 support to Extlinux installer.
 
 It's needed to enumerate both UFS1/2 since they have different magic numbers
 and super block offsets.
 Besides, UFS2 can be installed in the 0-64k range like BTRFS, whereas
-UFS1 can't.
+UFS1 can't. UFS2 has no cow feature unlike BTRFS.
 
 Signed-off-by: Raphael S.Carvalho <raphael.scarv@gmail.com>
 ---
- extlinux/main.c        |   71 +++++++++---
+ extlinux/main.c        |   79 ++++++++++---
  extlinux/ufs.h         |   26 ++++
  extlinux/ufs_fs.h      |  307 ++++++++++++++++++++++++++++++++++++++++++++++++
  libinstaller/syslxfs.h |    4 +-
- 4 files changed, 390 insertions(+), 18 deletions(-)
+ 4 files changed, 396 insertions(+), 20 deletions(-)
  create mode 100644 extlinux/ufs.h
  create mode 100644 extlinux/ufs_fs.h
 
 diff --git a/extlinux/main.c b/extlinux/main.c
-index aa20e1b..1ebf800 100644
+index 9ee9abb..737b668 100644
 --- a/extlinux/main.c
 +++ b/extlinux/main.c
 @@ -14,8 +14,8 @@
@@ -40,7 +40,7 @@ index aa20e1b..1ebf800 100644
 +#include "ufs.h"
 +#include "ufs_fs.h"
  #include "misc.h"
- #include "../version.h"
+ #include "version.h"
  #include "syslxint.h"
 @@ -76,8 +78,10 @@
  #define XFS_BOOTSECT_OFFSET	(4 << SECTOR_SHIFT)
@@ -105,16 +105,25 @@ index aa20e1b..1ebf800 100644
  		device);
  	return 1;
      }
-@@ -575,7 +594,7 @@ bail:
+@@ -575,9 +594,14 @@ bail:
      return 1;
  }
  
 -/* btrfs has to install the ldlinux.sys in the first 64K blank area, which
-+/* btrfs/ufs2 has to install the ldlinux.sys in the first 64K blank area, which
-    is not managered by btrfs tree, so actually this is not installed as files.
-    since the cow feature of btrfs will move the ldlinux.sys every where */
+-   is not managered by btrfs tree, so actually this is not installed as files.
+-   since the cow feature of btrfs will move the ldlinux.sys every where */
++/*
++ * btrfs/ufs2 has to install the ldlinux.sys in the first 64K blank area;
++ * so actually this is not installed as files.
++ *
++ * ufs2: not managed by UFS group descriptor (ufs2 has no cow feature).
++ * btrfs: not managed by btrfs tree; since the cow feature of btrfs will
++ * move the ldlinux.sys every where.
++ */
  int btrfs_install_file(const char *path, int devfd, struct stat *rst)
-@@ -955,9 +974,10 @@ static char * get_default_subvol(char * rootdir, char * subvol)
+ {
+     char *file;
+@@ -955,9 +979,10 @@ static char * get_default_subvol(char * rootdir, char * subvol)
  
  static int install_file(const char *path, int devfd, struct stat *rst)
  {
@@ -127,7 +136,7 @@ index aa20e1b..1ebf800 100644
  	return btrfs_install_file(path, devfd, rst);
      else if (fs_type == XFS)
  	return xfs_install_file(path, devfd, rst);
-@@ -983,7 +1003,7 @@ static int validate_device(const char *path, int devfd)
+@@ -983,7 +1008,7 @@ static int validate_device(const char *path, int devfd)
      struct statfs sfs;
      int pfd;
      int rv = -1;
@@ -136,7 +145,7 @@ index aa20e1b..1ebf800 100644
      pfd = open(path, O_RDONLY|O_DIRECTORY);
      if (pfd < 0)
  	goto err;
-@@ -1063,6 +1083,17 @@ static const char *find_device(const char *mtab_file, dev_t dev)
+@@ -1063,6 +1088,16 @@ static const char *find_device(const char *mtab_file, dev_t dev)
  		done = true;
  		break;
  	    }
@@ -147,14 +156,13 @@ index aa20e1b..1ebf800 100644
 +	    if (!strcmp(mnt->mnt_type, "ufs") && !stat(mnt->mnt_fsname, &dst) &&
 +		dst.st_rdev == dev) {
 +		done = true;
-+		break;
 +	    }
 +
 +	    break;
  	case NONE:
  	    break;
  	}
-@@ -1187,7 +1218,7 @@ static int validate_device_btrfs(int pfd, int dfd)
+@@ -1187,7 +1222,7 @@ static int validate_device_btrfs(int pfd, int dfd)
  	return -1;
  
      return 0;			/* It's good! */
@@ -163,7 +171,7 @@ index aa20e1b..1ebf800 100644
  
  static const char *find_device_btrfs(const char *path)
  {
-@@ -1276,7 +1307,7 @@ static const char *get_devname(const char *path)
+@@ -1276,7 +1311,7 @@ static const char *get_devname(const char *path)
  	    fprintf(stderr, "%s: cannot create device %s\n", program, devname);
  	    return devname;
  	}
@@ -172,7 +180,7 @@ index aa20e1b..1ebf800 100644
  	atexit(device_cleanup);	/* unlink the device node on exit */
  	devname = devname_buf;
      }
-@@ -1330,10 +1361,15 @@ static int open_device(const char *path, struct stat *st, const char **_devname)
+@@ -1330,10 +1365,15 @@ static int open_device(const char *path, struct stat *st, const char **_devname)
  	fs_type = NTFS;
      else if (sfs.f_type == XFS_SUPER_MAGIC)
  	fs_type = XFS;
@@ -189,7 +197,7 @@ index aa20e1b..1ebf800 100644
  		program, path);
  	return -1;
      }
-@@ -1382,8 +1418,8 @@ static int ext_read_adv(const char *path, int devfd, const char **namep)
+@@ -1382,8 +1422,8 @@ static int ext_read_adv(const char *path, int devfd, const char **namep)
      int err;
      const char *name;
  
@@ -200,7 +208,7 @@ index aa20e1b..1ebf800 100644
  	return btrfs_read_adv(devfd);
      } else if (fs_type == XFS) {
  	/* XFS "ldlinux.sys" is in the first 2048 bytes of the primary AG */
-@@ -1400,7 +1436,8 @@ static int ext_read_adv(const char *path, int devfd, const char **namep)
+@@ -1400,7 +1440,8 @@ static int ext_read_adv(const char *path, int devfd, const char **namep)
  
  static int ext_write_adv(const char *path, const char *cfg, int devfd)
  {
