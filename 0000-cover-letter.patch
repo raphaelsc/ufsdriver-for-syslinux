@@ -1,0 +1,84 @@
+From 78be2542928dd4dce0ecd7d40b60689d21f15c0a Mon Sep 17 00:00:00 2001
+From: Raphael S. Carvalho <raphael.scarv@gmail.com>
+Date: Thu, 29 May 2014 20:28:56 -0300
+Subject: [PATCH v2 0/2] UFS1/2 support series
+
+Change since v1:
+* Fix bug on dentry structure (thank you specification; btw, sarcasm), and
+consequently a bug on ufs_readdir.
+* Add readlink support (applied tests for symlinks whose destionation path
+were stored in blk pointers and the file itself).
+* Several improvements.
+
+Wrote the documentation below. I think it would be good to push the doc to
+the wiki as soon as the UFS support gets merged.
+
+Unix Fast File System (UFS/FFS) 1/2 on Syslinux - (usage/install)
+-----
+There is a confusion about the name of this file system, then I decided to
+contact the author, Kirk McKusick, who replied:
+"The name has always been confusing (my bad). The code is broken into two
+parts, the part that handles naming (UFS where the U stands for Unix), and the
+part that handles disk layout (FFS where the F stands for Fast).
+When the two parts are put together they are called UFS/FFS or more commonly
+just UFS."
+
+Dependencies:
+- Environment:
+Require a *GNU/Linux* system to follow these steps.
+- Package:
+ufsutils (UFS filesystems utilities)
+- Device driver:
+UFS support on Linux: you need a kernel with the option CONFIG_UFS_FS_WRITE
+enabled or at least configured as a module.
+For the latter case, load the module ufs.ko with modprobe (probably located
+at: /lib/modules/).
+If this option wasn't even configured as a module, then you need to recompile
+your kernel with that option enabled.
+Further information can be found in the link below:
+http://oz123.github.io/writings/2012-11-26-enable-ufs-write-support-debian/
+
+Creating an UFS image:
+    sudo dd if=/dev/zero of=<image> bs= count=;
+    - UFS1:
+    sudo mkfs.ufs -O 1 <image>;
+    - UFS2:
+    sudo mkfs.ufs <image>;
+
+Mounting an UFS image:
+    - UFS1:
+    sudo mount -t ufs -o rw,loop,ufstype=44bsd <image> <mountpoint>;
+    - UFS2:
+    sudo mount -t ufs -o rw,loop,ufstype=ufs2 <image> <mountpoint>;
+
+Installing syslinux on an UFS image:
+    - Install extlinux into your mount point:
+    sudo extlinux -i <mountpoint>;
+
+    - Finally, set up the syslinux config file.
+
+
+Thanks for pcacjr who introduced me to Syslinux :-)
+
+Raphael S. Carvalho (2):
+  installer: Add UFS1/2 support for Extlinux installer
+  core/fs: Add support to Unix File system 1/2.
+
+ core/fs/ufs/bmap.c     |  202 ++++++++++++++++++++
+ core/fs/ufs/ufs.c      |  486 ++++++++++++++++++++++++++++++++++++++++++++++++
+ core/fs/ufs/ufs.h      |  254 +++++++++++++++++++++++++
+ core/ldlinux.asm       |    2 +
+ extlinux/main.c        |   51 ++++-
+ extlinux/ufs.h         |   26 +++
+ extlinux/ufs_fs.h      |  307 ++++++++++++++++++++++++++++++
+ libinstaller/syslxfs.h |    4 +-
+ 8 files changed, 1322 insertions(+), 10 deletions(-)
+ create mode 100644 core/fs/ufs/bmap.c
+ create mode 100644 core/fs/ufs/ufs.c
+ create mode 100644 core/fs/ufs/ufs.h
+ create mode 100644 extlinux/ufs.h
+ create mode 100644 extlinux/ufs_fs.h
+
+-- 
+1.7.2.5
+

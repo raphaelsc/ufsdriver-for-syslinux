@@ -1,25 +1,26 @@
-From fedc29b1351f96b3445111884e6cbf5b74abe6c7 Mon Sep 17 00:00:00 2001
-From: Raphael S.Carvalho <raphael.scarv@gmail.com>
-Date: Sun, 21 Jul 2013 22:58:27 -0300
-Subject: [PATCH 1/1 v2] Add UFS1/2 support to Extlinux installer.
+From d0e9d700100c6f3c1c0b5503a1177d1d253fa595 Mon Sep 17 00:00:00 2001
+From: Raphael S. Carvalho <raphael.scarv@gmail.com>
+Date: Thu, 29 May 2014 11:15:34 -0300
+Subject: [PATCH v2 1/2] installer: Add UFS1/2 support for Extlinux installer
 
-It's needed to enumerate both UFS1/2 since they have different magic numbers
+It's needed to enumerate both UFS1 and UFS2 as they have different magic numbers
 and super block offsets.
-Besides, UFS2 can be installed in the 0-64k range like BTRFS, whereas
-UFS1 can't. UFS2 has no cow feature unlike BTRFS.
 
-Signed-off-by: Raphael S.Carvalho <raphael.scarv@gmail.com>
+Neither UFS1 nor UFS2 have COW feature, therefore, ldlinux.sys can be installed
+as a regular file.
+
+Signed-off-by: Raphael S. Carvalho <raphael.scarv@gmail.com>
 ---
- extlinux/main.c        |   79 ++++++++++---
+ extlinux/main.c        |   51 +++++++--
  extlinux/ufs.h         |   26 ++++
  extlinux/ufs_fs.h      |  307 ++++++++++++++++++++++++++++++++++++++++++++++++
  libinstaller/syslxfs.h |    4 +-
- 4 files changed, 396 insertions(+), 20 deletions(-)
+ 4 files changed, 378 insertions(+), 10 deletions(-)
  create mode 100644 extlinux/ufs.h
  create mode 100644 extlinux/ufs_fs.h
 
 diff --git a/extlinux/main.c b/extlinux/main.c
-index 9ee9abb..737b668 100644
+index 47c1e68..6b9a04b 100644
 --- a/extlinux/main.c
 +++ b/extlinux/main.c
 @@ -14,8 +14,8 @@
@@ -42,35 +43,16 @@ index 9ee9abb..737b668 100644
  #include "misc.h"
  #include "version.h"
  #include "syslxint.h"
-@@ -76,8 +78,10 @@
- #define XFS_BOOTSECT_OFFSET	(4 << SECTOR_SHIFT)
- #define XFS_SUPPORTED_BLOCKSIZE 4096 /* 4 KiB filesystem block size */
- 
--/* the btrfs partition first 64K blank area is used to store boot sector and
--   boot image, the boot sector is from 0~512, the boot image starts after */
-+/*
-+ * the btrfs/ufs2 partition first 64K blank area is used to store boot sector
-+ * and boot image, the boot sector is from 0~512, the boot image starts after
-+ */
- #define BTRFS_BOOTSECT_AREA	65536
- #define BTRFS_EXTLINUX_OFFSET	SECTOR_SIZE
- #define BTRFS_SUBVOL_MAX 256	/* By btrfs specification */
-@@ -308,12 +312,12 @@ static int patch_file_and_bootblock(int fd, const char *dir, int devfd)
+@@ -308,7 +310,7 @@ static int patch_file_and_bootblock(int fd, const char *dir, int devfd)
      nsect += 2;			/* Two sectors for the ADV */
      sectp = alloca(sizeof(sector_t) * nsect);
      if (fs_type == EXT2 || fs_type == VFAT || fs_type == NTFS ||
 -	fs_type == XFS) {
-+	fs_type == XFS || fs_type == UFS1) {
++	fs_type == XFS || fs_type == UFS1 || fs_type == UFS2) {
  	if (sectmap(fd, sectp, nsect)) {
  		perror("bmap");
  		exit(1);
- 	}
--    } else if (fs_type == BTRFS) {
-+    } else if (fs_type == BTRFS || fs_type == UFS2) {
- 	int i;
- 	sector_t *sp = sectp;
- 
-@@ -342,6 +346,7 @@ int install_bootblock(int fd, const char *device)
+@@ -342,6 +344,7 @@ int install_bootblock(int fd, const char *device)
      struct fat_boot_sector sb3;
      struct ntfs_boot_sector sb4;
      xfs_sb_t sb5;
@@ -78,7 +60,7 @@ index 9ee9abb..737b668 100644
      bool ok = false;
  
      if (fs_type == EXT2) {
-@@ -395,11 +400,25 @@ int install_bootblock(int fd, const char *device)
+@@ -395,11 +398,25 @@ int install_bootblock(int fd, const char *device)
  
  	    ok = true;
  	}
@@ -105,38 +87,17 @@ index 9ee9abb..737b668 100644
  		device);
  	return 1;
      }
-@@ -575,9 +594,14 @@ bail:
-     return 1;
- }
- 
--/* btrfs has to install the ldlinux.sys in the first 64K blank area, which
--   is not managered by btrfs tree, so actually this is not installed as files.
--   since the cow feature of btrfs will move the ldlinux.sys every where */
-+/*
-+ * btrfs/ufs2 has to install the ldlinux.sys in the first 64K blank area;
-+ * so actually this is not installed as files.
-+ *
-+ * ufs2: not managed by UFS group descriptor (ufs2 has no cow feature).
-+ * btrfs: not managed by btrfs tree; since the cow feature of btrfs will
-+ * move the ldlinux.sys every where.
-+ */
- int btrfs_install_file(const char *path, int devfd, struct stat *rst)
- {
-     char *file;
-@@ -955,9 +979,10 @@ static char * get_default_subvol(char * rootdir, char * subvol)
+@@ -959,7 +976,8 @@ static char * get_default_subvol(char * rootdir, char * subvol)
  
  static int install_file(const char *path, int devfd, struct stat *rst)
  {
 -    if (fs_type == EXT2 || fs_type == VFAT || fs_type == NTFS)
 +    if (fs_type == EXT2 || fs_type == VFAT || fs_type == NTFS
-+	|| fs_type == UFS1)
++	|| fs_type == UFS1 || fs_type == UFS2)
  	return ext2_fat_install_file(path, devfd, rst);
--    else if (fs_type == BTRFS)
-+    else if (fs_type == BTRFS || fs_type == UFS2)
+     else if (fs_type == BTRFS)
  	return btrfs_install_file(path, devfd, rst);
-     else if (fs_type == XFS)
- 	return xfs_install_file(path, devfd, rst);
-@@ -983,7 +1008,7 @@ static int validate_device(const char *path, int devfd)
+@@ -987,7 +1005,7 @@ static int validate_device(const char *path, int devfd)
      struct statfs sfs;
      int pfd;
      int rv = -1;
@@ -145,7 +106,7 @@ index 9ee9abb..737b668 100644
      pfd = open(path, O_RDONLY|O_DIRECTORY);
      if (pfd < 0)
  	goto err;
-@@ -1063,6 +1088,16 @@ static const char *find_device(const char *mtab_file, dev_t dev)
+@@ -1067,6 +1085,16 @@ static const char *find_device(const char *mtab_file, dev_t dev)
  		done = true;
  		break;
  	    }
@@ -162,7 +123,7 @@ index 9ee9abb..737b668 100644
  	case NONE:
  	    break;
  	}
-@@ -1187,7 +1222,7 @@ static int validate_device_btrfs(int pfd, int dfd)
+@@ -1191,7 +1219,7 @@ static int validate_device_btrfs(int pfd, int dfd)
  	return -1;
  
      return 0;			/* It's good! */
@@ -171,7 +132,7 @@ index 9ee9abb..737b668 100644
  
  static const char *find_device_btrfs(const char *path)
  {
-@@ -1276,7 +1311,7 @@ static const char *get_devname(const char *path)
+@@ -1280,7 +1308,7 @@ static const char *get_devname(const char *path)
  	    fprintf(stderr, "%s: cannot create device %s\n", program, devname);
  	    return devname;
  	}
@@ -180,7 +141,7 @@ index 9ee9abb..737b668 100644
  	atexit(device_cleanup);	/* unlink the device node on exit */
  	devname = devname_buf;
      }
-@@ -1330,10 +1365,15 @@ static int open_device(const char *path, struct stat *st, const char **_devname)
+@@ -1334,10 +1362,15 @@ static int open_device(const char *path, struct stat *st, const char **_devname)
  	fs_type = NTFS;
      else if (sfs.f_type == XFS_SUPER_MAGIC)
  	fs_type = XFS;
@@ -197,27 +158,6 @@ index 9ee9abb..737b668 100644
  		program, path);
  	return -1;
      }
-@@ -1382,8 +1422,8 @@ static int ext_read_adv(const char *path, int devfd, const char **namep)
-     int err;
-     const char *name;
- 
--    if (fs_type == BTRFS) {
--	/* btrfs "ldlinux.sys" is in 64k blank area */
-+    if (fs_type == BTRFS || fs_type == UFS2) {
-+	/* btrfs/ufs2 "ldlinux.sys" is in 64k blank area */
- 	return btrfs_read_adv(devfd);
-     } else if (fs_type == XFS) {
- 	/* XFS "ldlinux.sys" is in the first 2048 bytes of the primary AG */
-@@ -1400,7 +1440,8 @@ static int ext_read_adv(const char *path, int devfd, const char **namep)
- 
- static int ext_write_adv(const char *path, const char *cfg, int devfd)
- {
--    if (fs_type == BTRFS) { /* btrfs "ldlinux.sys" is in 64k blank area */
-+    /* btrfs/ufs2 "ldlinux.sys" is in 64k blank area */
-+    if (fs_type == BTRFS || fs_type == UFS2) {
- 	if (xpwrite(devfd, syslinux_adv, 2 * ADV_SIZE,
- 		BTRFS_ADV_OFFSET) != 2 * ADV_SIZE) {
- 		perror("writing adv");
 diff --git a/extlinux/ufs.h b/extlinux/ufs.h
 new file mode 100644
 index 0000000..d324699

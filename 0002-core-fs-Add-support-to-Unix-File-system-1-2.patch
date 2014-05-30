@@ -1,28 +1,25 @@
-From 2b81bcbb5c5fd6565f43575889e5c4e31be92996 Mon Sep 17 00:00:00 2001
-From: Raphael S.Carvalho <raphael.scarv@gmail.com>
-Date: Fri, 12 Jul 2013 20:52:00 -0300
-Subject: [PATCH 001/001] core/fs: Add support to Unix File system 1/2.
+From 78be2542928dd4dce0ecd7d40b60689d21f15c0a Mon Sep 17 00:00:00 2001
+From: Raphael S. Carvalho <raphael.scarv@gmail.com>
+Date: Thu, 29 May 2014 11:16:10 -0300
+Subject: [PATCH v2 2/2] core/fs: Add support to Unix File system 1/2.
 
-It's already loading modules successfully, and both UFS version 1 and 2
-seems to be working correctly.
+It's already loading modules successfully, booting Linux, and both
+UFS version 1 and 2 seem to be working correctly.
 
-Special thanks to Paulo Alcantara and Matt Fleming for being always ready to help me
-and give feedback.
-
-Signed-off-by: Raphael S.Carvalho <raphael.scarv@gmail.com>
+Signed-off-by: Raphael S. Carvalho <raphael.scarv@gmail.com>
 ---
- core/fs/ufs/bmap.c |  202 ++++++++++++++++++++++++++
- core/fs/ufs/ufs.c  |  404 ++++++++++++++++++++++++++++++++++++++++++++++++++++
- core/fs/ufs/ufs.h  |  253 ++++++++++++++++++++++++++++++++
+ core/fs/ufs/bmap.c |  202 ++++++++++++++++++++++
+ core/fs/ufs/ufs.c  |  486 ++++++++++++++++++++++++++++++++++++++++++++++++++++
+ core/fs/ufs/ufs.h  |  254 +++++++++++++++++++++++++++
  core/ldlinux.asm   |    2 +
- 4 files changed, 861 insertions(+), 0 deletions(-)
+ 4 files changed, 944 insertions(+), 0 deletions(-)
  create mode 100644 core/fs/ufs/bmap.c
  create mode 100644 core/fs/ufs/ufs.c
  create mode 100644 core/fs/ufs/ufs.h
 
 diff --git a/core/fs/ufs/bmap.c b/core/fs/ufs/bmap.c
 new file mode 100644
-index 0000000..117daef
+index 0000000..7d8490f
 --- /dev/null
 +++ b/core/fs/ufs/bmap.c
 @@ -0,0 +1,202 @@
@@ -82,8 +79,8 @@ index 0000000..117daef
 +	/* Get address of starting blk pointer */
 +	map += (index << addr_shift);
 +
-+	//ufs_debug("[scan] start blk: %u\n", blk);
-+	//ufs_debug("[scan] count (nr of blks): %u\n", count);
++	ufs_debug("[scan] start blk: %u\n", blk);
++	ufs_debug("[scan] count (nr of blks): %u\n", count);
 +	/* Go up to the end of blk map */
 +	while (--count) {
 +	    map += 1 << addr_shift;
@@ -101,7 +98,7 @@ index 0000000..117daef
 +	}
 +	*nblocks = cnt;
 +	ufs_debug("[scan] nblocks: %u\n", cnt);
-+	//ufs_debug("[scan] end blk: %u\n", next - FRAGMENTS_PER_BLK);
++	ufs_debug("[scan] end blk: %u\n", next - FRAGMENTS_PER_BLK);
 +    }
 +
 +    return blk;
@@ -119,9 +116,9 @@ index 0000000..117daef
 +bmap_indirect(struct fs_info *fs, uint64_t start, uint32_t block,
 +	      int levels, size_t *nblocks)
 +{
-+    const uint32_t shft_per_blk = fs->block_shift - UFS_SB(fs)->addr_shift;
-+    const uint32_t addr_count = (1 << shft_per_blk);
-+    const uint32_t mask_per_blk = addr_count - 1;
++    uint32_t shft_per_blk = fs->block_shift - UFS_SB(fs)->addr_shift;
++    uint32_t addr_count = (1 << shft_per_blk);
++    uint32_t mask_per_blk = addr_count - 1;
 +    const uint8_t *blk = NULL;
 +    uint32_t index = 0;
 +
@@ -218,7 +215,7 @@ index 0000000..117daef
 +	 * sectors into pstart (sector start address).
 +	 */
 +	inode->next_extent.pstart =
-+	    ((sector_t) (block << frag_shift) >> SECTOR_SHIFT(fs)) |
++	    ((sector_t) (block << (frag_shift - SECTOR_SHIFT(fs)))) |
 +	    (lstart & blkmask);
 +
 +    /*
@@ -231,10 +228,10 @@ index 0000000..117daef
 \ No newline at end of file
 diff --git a/core/fs/ufs/ufs.c b/core/fs/ufs/ufs.c
 new file mode 100644
-index 0000000..25c8526
+index 0000000..a7ef28f
 --- /dev/null
 +++ b/core/fs/ufs/ufs.c
-@@ -0,0 +1,404 @@
+@@ -0,0 +1,486 @@
 +/*
 + * Copyright (C) 2013 Raphael S. Carvalho <raphael.scarv@gmail.com>
 + *
@@ -515,15 +512,94 @@ index 0000000..25c8526
 +    return UFS_SB(fs)->ufs_iget_by_inr(fs, dir->inode_value);
 +}
 +
++static void ufs1_read_blkaddrs(struct inode *inode, char *buf)
++{
++    uint32_t dest[UFS_NBLOCKS];
++    const uint64_t *source = (uint64_t *) (inode->pvt);
++    int i;
++
++    /* Convert ufs_inode_pvt uint64_t fields into uint32_t
++     * Upper-half part of ufs1 private blk addrs are always supposed to be
++     * zero (it's previosuly extended by us), thus data isn't being lost. */
++    for (i = 0; i < UFS_NBLOCKS; i++) {
++        if ((source[i] >> 32) != 0) {
++            /* This should never happen, but will not prevent anything
++             * from working. */
++            ufs_debug("ufs1: inode->pvt[%d]: warning!\n", i);
++        }
++
++        dest[i] = (uint32_t)(source[i] & 0xFFFFFFFF);
++    }
++    memcpy(buf, (const char *) dest, inode->size);
++}
++
++static void ufs2_read_blkaddrs(struct inode *inode, char *buf)
++{
++    memcpy(buf, (const char *) (inode->pvt), inode->size);
++}
++
++/*
++ * Taken from ext2/ext2.c.
++ * Read the entire contents of an inode into a memory buffer
++ */
++static int cache_get_file(struct inode *inode, void *buf, size_t bytes)
++{
++    struct fs_info *fs = inode->fs;
++    size_t block_size = BLOCK_SIZE(fs);
++    uint32_t index = 0;         /* Logical block number */
++    size_t chunk;
++    const char *data;
++    char *p = buf;
++
++    if (inode->size > bytes)
++        bytes = inode->size;
++
++    while (bytes) {
++        chunk = min(bytes, block_size);
++        data = ufs_get_cache(inode, index++);
++        memcpy(p, data, chunk);
++
++        bytes -= chunk;
++        p += chunk;
++    }
++
++    return 0;
++}
++
 +static int ufs_readlink(struct inode *inode, char *buf)
 +{
-+    ufs_debug("ufs_readlink\n");
++    struct fs_info *fs = inode->fs;
++    uint32_t i_symlink_limit;
++
++    if (inode->size > BLOCK_SIZE(fs))
++        return -1;              /* Error! */
++
++    // TODO: use UFS_SB(fs)->maxlen_isymlink instead.
++    i_symlink_limit = ((UFS_SB(fs)->fs_type == UFS1) ?
++        sizeof(uint32_t) : sizeof(uint64_t)) * UFS_NBLOCKS;
++    ufs_debug("UFS_SB(fs)->maxlen_isymlink=%d", UFS_SB(fs)->maxlen_isymlink);
++
++    if (inode->size <= i_symlink_limit)
++        UFS_SB(fs)->ufs_read_blkaddrs(inode, buf);
++    else
++        cache_get_file(inode, buf, inode->size);
++
 +    return inode->size;
 +}
 +
-+static inline enum dir_type_flags get_inode_mode(uint8_t attr)
++static inline enum dir_type_flags get_inode_mode(uint8_t type)
 +{
-+    return (attr & UFS_DTYPE_DIR) ? DT_DIR : DT_REG;
++    switch(type) {
++        case UFS_DTYPE_FIFO: return DT_FIFO;
++        case UFS_DTYPE_CHARDEV: return DT_CHR;
++        case UFS_DTYPE_DIR: return DT_DIR;
++        case UFS_DTYPE_BLOCK: return DT_BLK;
++        case UFS_DTYPE_RFILE: return DT_REG;
++        case UFS_DTYPE_SYMLINK: return DT_LNK;
++        case UFS_DTYPE_SOCKET: return DT_SOCK;
++        case UFS_DTYPE_WHITEOUT: return DT_WHT;
++        default: return DT_UNKNOWN;
++    }
 +}
 +
 +/*
@@ -547,7 +623,7 @@ index 0000000..25c8526
 +    dirent->d_ino = dir->inode_value;
 +    dirent->d_off = file->offset;
 +    dirent->d_reclen = offsetof(struct dirent, d_name) + dir->name_length + 1;
-+    dirent->d_type = get_inode_mode(dir->file_type);
++    dirent->d_type = get_inode_mode(dir->file_type & 0x0F);
 +    memcpy(dirent->d_name, dir->name, dir->name_length);
 +    dirent->d_name[dir->name_length] = '\0';
 +
@@ -572,11 +648,13 @@ index 0000000..25c8526
 +	sbi->ufs1.delta_value = sb->ufs1.delta_value;
 +	sbi->ufs1.cycle_mask = sb->ufs1.cycle_mask;
 +	sbi->ufs_iget_by_inr = ufs1_iget_by_inr;
++        sbi->ufs_read_blkaddrs = ufs1_read_blkaddrs;
 +	sbi->addr_shift = UFS1_ADDR_SHIFT;
 +    } else { // UFS2 or UFS2_PIGGY
 +	sbi->inode_size = sizeof (struct ufs2_inode);
 +	sbi->groups_count = sb->ufs2.nr_frags / sb->frags_per_cg;
 +	sbi->ufs_iget_by_inr = ufs2_iget_by_inr;
++        sbi->ufs_read_blkaddrs = ufs2_read_blkaddrs;
 +	sbi->addr_shift = UFS2_ADDR_SHIFT;
 +    }
 +    sbi->inodes_per_block = sb->block_size / sbi->inode_size;
@@ -584,6 +662,7 @@ index 0000000..25c8526
 +    sbi->blocks_per_cg = sb->frags_per_cg >> sb->c_blk_frag_shift;
 +    sbi->off_inode_tbl = sb->off_inode_tbl >> sb->c_blk_frag_shift;
 +    sbi->c_blk_frag_shift = sb->c_blk_frag_shift;
++    sbi->maxlen_isymlink = sb->maxlen_isymlink;
 +    sbi->fs_type = ufs_type;
 +
 +    return sbi;
@@ -633,7 +712,7 @@ index 0000000..25c8526
 +    .close_file     = generic_close_file,
 +    .mangle_name    = generic_mangle_name,
 +    .open_config    = generic_open_config,
-+    .readlink	    = NULL,
++    .readlink	    = ufs_readlink,
 +    .readdir        = ufs_readdir,
 +    .iget_root      = ufs_iget_root,
 +    .iget           = ufs_iget,
@@ -641,10 +720,10 @@ index 0000000..25c8526
 +};
 diff --git a/core/fs/ufs/ufs.h b/core/fs/ufs/ufs.h
 new file mode 100644
-index 0000000..fd7f665
+index 0000000..04e9f84
 --- /dev/null
 +++ b/core/fs/ufs/ufs.h
-@@ -0,0 +1,253 @@
+@@ -0,0 +1,254 @@
 +/*
 + * Copyright (C) 2013 Raphael S. Carvalho <raphael.scarv@gmail.com>
 + *
@@ -773,7 +852,9 @@ index 0000000..fd7f665
 +    uint32_t groups_count; // Number of groups in the fs
 +    uint32_t addr_shift; // 2 ^ addr_shift = size in bytes of default addr.
 +    uint32_t c_blk_frag_shift; // Convert blk/frag addr (vice-versa)
-+    struct   inode *(*ufs_iget_by_inr)(struct fs_info *, uint32_t);
++    uint32_t maxlen_isymlink; // Max length of internal symlink
++    struct inode *(*ufs_iget_by_inr)(struct fs_info *, uint32_t);
++    void (*ufs_read_blkaddrs)(struct inode *, char *);
 +    ufs_t    fs_type; // { UFS1, UFS2, UFS2_PIGGY }
 +};
 +
@@ -851,6 +932,7 @@ index 0000000..fd7f665
 +} __attribute__((__packed__));
 +
 +#define PVT(p) ((struct ufs_inode_pvt *) p->pvt)
++
 +struct ufs_inode_pvt {
 +    uint64_t direct_blk_ptr[12];
 +    uint64_t indirect_blk_ptr;
@@ -861,10 +943,10 @@ index 0000000..fd7f665
 +struct ufs_dir_entry {
 +    uint32_t inode_value;
 +    uint16_t dir_entry_len;
-+    uint8_t  name_length;
 +    uint8_t  file_type;
++    uint8_t  name_length;
 +    uint8_t  name[1]; // Dir names are null terminated!!!
-+};
++} __attribute__((__packed__));
 +
 +enum inode_type_flags {
 +    UFS_INO_FIFO	= 0x1000,
@@ -880,11 +962,9 @@ index 0000000..fd7f665
 +    UFS_DTYPE_UNKNOWN	= 0,
 +    UFS_DTYPE_FIFO 	= 1,
 +    UFS_DTYPE_CHARDEV	= 2,
-+    // FIXME: 3 seems to be a valid type for directories.
-+    UFS_DTYPE_DIR 	= 4 | 3,
++    UFS_DTYPE_DIR 	= 4,
 +    UFS_DTYPE_BLOCK	= 6,
-+    // FIXME: block_device (6) seems to be a valid type for regular files.
-+    UFS_DTYPE_RFILE	= 8 | 6,
++    UFS_DTYPE_RFILE	= 8,
 +    UFS_DTYPE_SYMLINK 	= 10,
 +    UFS_DTYPE_SOCKET	= 12,
 +    UFS_DTYPE_WHITEOUT 	= 14,

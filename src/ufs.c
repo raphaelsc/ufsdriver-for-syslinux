@@ -278,15 +278,94 @@ ufs_iget(const char *dname, struct inode *parent)
     return UFS_SB(fs)->ufs_iget_by_inr(fs, dir->inode_value);
 }
 
+static void ufs1_read_blkaddrs(struct inode *inode, char *buf)
+{
+    uint32_t dest[UFS_NBLOCKS];
+    const uint64_t *source = (uint64_t *) (inode->pvt);
+    int i;
+
+    /* Convert ufs_inode_pvt uint64_t fields into uint32_t
+     * Upper-half part of ufs1 private blk addrs are always supposed to be
+     * zero (it's previosuly extended by us), thus data isn't being lost. */
+    for (i = 0; i < UFS_NBLOCKS; i++) {
+        if ((source[i] >> 32) != 0) {
+            /* This should never happen, but will not prevent anything
+             * from working. */
+            ufs_debug("ufs1: inode->pvt[%d]: warning!\n", i);
+        }
+
+        dest[i] = (uint32_t)(source[i] & 0xFFFFFFFF);
+    }
+    memcpy(buf, (const char *) dest, inode->size);
+}
+
+static void ufs2_read_blkaddrs(struct inode *inode, char *buf)
+{
+    memcpy(buf, (const char *) (inode->pvt), inode->size);
+}
+
+/*
+ * Taken from ext2/ext2.c.
+ * Read the entire contents of an inode into a memory buffer
+ */
+static int cache_get_file(struct inode *inode, void *buf, size_t bytes)
+{
+    struct fs_info *fs = inode->fs;
+    size_t block_size = BLOCK_SIZE(fs);
+    uint32_t index = 0;         /* Logical block number */
+    size_t chunk;
+    const char *data;
+    char *p = buf;
+
+    if (inode->size > bytes)
+        bytes = inode->size;
+
+    while (bytes) {
+        chunk = min(bytes, block_size);
+        data = ufs_get_cache(inode, index++);
+        memcpy(p, data, chunk);
+
+        bytes -= chunk;
+        p += chunk;
+    }
+
+    return 0;
+}
+
 static int ufs_readlink(struct inode *inode, char *buf)
 {
-    ufs_debug("ufs_readlink\n");
+    struct fs_info *fs = inode->fs;
+    uint32_t i_symlink_limit;
+
+    if (inode->size > BLOCK_SIZE(fs))
+        return -1;              /* Error! */
+
+    // TODO: use UFS_SB(fs)->maxlen_isymlink instead.
+    i_symlink_limit = ((UFS_SB(fs)->fs_type == UFS1) ?
+        sizeof(uint32_t) : sizeof(uint64_t)) * UFS_NBLOCKS;
+    ufs_debug("UFS_SB(fs)->maxlen_isymlink=%d", UFS_SB(fs)->maxlen_isymlink);
+
+    if (inode->size <= i_symlink_limit)
+        UFS_SB(fs)->ufs_read_blkaddrs(inode, buf);
+    else
+        cache_get_file(inode, buf, inode->size);
+
     return inode->size;
 }
 
-static inline enum dir_type_flags get_inode_mode(uint8_t attr)
+static inline enum dir_type_flags get_inode_mode(uint8_t type)
 {
-    return (attr & UFS_DTYPE_DIR) ? DT_DIR : DT_REG;
+    switch(type) {
+        case UFS_DTYPE_FIFO: return DT_FIFO;
+        case UFS_DTYPE_CHARDEV: return DT_CHR;
+        case UFS_DTYPE_DIR: return DT_DIR;
+        case UFS_DTYPE_BLOCK: return DT_BLK;
+        case UFS_DTYPE_RFILE: return DT_REG;
+        case UFS_DTYPE_SYMLINK: return DT_LNK;
+        case UFS_DTYPE_SOCKET: return DT_SOCK;
+        case UFS_DTYPE_WHITEOUT: return DT_WHT;
+        default: return DT_UNKNOWN;
+    }
 }
 
 /*
@@ -310,7 +389,7 @@ static int ufs_readdir(struct file *file, struct dirent *dirent)
     dirent->d_ino = dir->inode_value;
     dirent->d_off = file->offset;
     dirent->d_reclen = offsetof(struct dirent, d_name) + dir->name_length + 1;
-    dirent->d_type = get_inode_mode(dir->file_type);
+    dirent->d_type = get_inode_mode(dir->file_type & 0x0F);
     memcpy(dirent->d_name, dir->name, dir->name_length);
     dirent->d_name[dir->name_length] = '\0';
 
@@ -335,11 +414,13 @@ set_ufs_info(struct ufs_super_block *sb, int ufs_type)
 	sbi->ufs1.delta_value = sb->ufs1.delta_value;
 	sbi->ufs1.cycle_mask = sb->ufs1.cycle_mask;
 	sbi->ufs_iget_by_inr = ufs1_iget_by_inr;
+        sbi->ufs_read_blkaddrs = ufs1_read_blkaddrs;
 	sbi->addr_shift = UFS1_ADDR_SHIFT;
     } else { // UFS2 or UFS2_PIGGY
 	sbi->inode_size = sizeof (struct ufs2_inode);
 	sbi->groups_count = sb->ufs2.nr_frags / sb->frags_per_cg;
 	sbi->ufs_iget_by_inr = ufs2_iget_by_inr;
+        sbi->ufs_read_blkaddrs = ufs2_read_blkaddrs;
 	sbi->addr_shift = UFS2_ADDR_SHIFT;
     }
     sbi->inodes_per_block = sb->block_size / sbi->inode_size;
@@ -347,6 +428,7 @@ set_ufs_info(struct ufs_super_block *sb, int ufs_type)
     sbi->blocks_per_cg = sb->frags_per_cg >> sb->c_blk_frag_shift;
     sbi->off_inode_tbl = sb->off_inode_tbl >> sb->c_blk_frag_shift;
     sbi->c_blk_frag_shift = sb->c_blk_frag_shift;
+    sbi->maxlen_isymlink = sb->maxlen_isymlink;
     sbi->fs_type = ufs_type;
 
     return sbi;
@@ -396,7 +478,7 @@ const struct fs_ops ufs_fs_ops = {
     .close_file     = generic_close_file,
     .mangle_name    = generic_mangle_name,
     .open_config    = generic_open_config,
-    .readlink	    = NULL,
+    .readlink	    = ufs_readlink,
     .readdir        = ufs_readdir,
     .iget_root      = ufs_iget_root,
     .iget           = ufs_iget,

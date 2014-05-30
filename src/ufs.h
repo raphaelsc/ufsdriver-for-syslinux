@@ -126,7 +126,9 @@ struct ufs_sb_info {
     uint32_t groups_count; // Number of groups in the fs
     uint32_t addr_shift; // 2 ^ addr_shift = size in bytes of default addr.
     uint32_t c_blk_frag_shift; // Convert blk/frag addr (vice-versa)
-    struct   inode *(*ufs_iget_by_inr)(struct fs_info *, uint32_t);
+    uint32_t maxlen_isymlink; // Max length of internal symlink
+    struct inode *(*ufs_iget_by_inr)(struct fs_info *, uint32_t);
+    void (*ufs_read_blkaddrs)(struct inode *, char *);
     ufs_t    fs_type; // { UFS1, UFS2, UFS2_PIGGY }
 };
 
@@ -204,6 +206,7 @@ struct ufs2_inode {
 } __attribute__((__packed__));
 
 #define PVT(p) ((struct ufs_inode_pvt *) p->pvt)
+
 struct ufs_inode_pvt {
     uint64_t direct_blk_ptr[12];
     uint64_t indirect_blk_ptr;
@@ -214,10 +217,10 @@ struct ufs_inode_pvt {
 struct ufs_dir_entry {
     uint32_t inode_value;
     uint16_t dir_entry_len;
-    uint8_t  name_length;
     uint8_t  file_type;
+    uint8_t  name_length;
     uint8_t  name[1]; // Dir names are null terminated!!!
-};
+} __attribute__((__packed__));
 
 enum inode_type_flags {
     UFS_INO_FIFO	= 0x1000,
@@ -233,11 +236,9 @@ enum dir_type_flags {
     UFS_DTYPE_UNKNOWN	= 0,
     UFS_DTYPE_FIFO 	= 1,
     UFS_DTYPE_CHARDEV	= 2,
-    // FIXME: 3 seems to be a valid type for directories.
-    UFS_DTYPE_DIR 	= 4 | 3,
+    UFS_DTYPE_DIR 	= 4,
     UFS_DTYPE_BLOCK	= 6,
-    // FIXME: block_device (6) seems to be a valid type for regular files.
-    UFS_DTYPE_RFILE	= 8 | 6,
+    UFS_DTYPE_RFILE	= 8,
     UFS_DTYPE_SYMLINK 	= 10,
     UFS_DTYPE_SOCKET	= 12,
     UFS_DTYPE_WHITEOUT 	= 14,

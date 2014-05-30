@@ -54,8 +54,8 @@ scan_set_nblocks(const uint8_t *map, uint32_t index, uint32_t addr_shift,
 	/* Get address of starting blk pointer */
 	map += (index << addr_shift);
 
-	//ufs_debug("[scan] start blk: %u\n", blk);
-	//ufs_debug("[scan] count (nr of blks): %u\n", count);
+	ufs_debug("[scan] start blk: %u\n", blk);
+	ufs_debug("[scan] count (nr of blks): %u\n", count);
 	/* Go up to the end of blk map */
 	while (--count) {
 	    map += 1 << addr_shift;
@@ -73,7 +73,7 @@ scan_set_nblocks(const uint8_t *map, uint32_t index, uint32_t addr_shift,
 	}
 	*nblocks = cnt;
 	ufs_debug("[scan] nblocks: %u\n", cnt);
-	//ufs_debug("[scan] end blk: %u\n", next - FRAGMENTS_PER_BLK);
+	ufs_debug("[scan] end blk: %u\n", next - FRAGMENTS_PER_BLK);
     }
 
     return blk;
@@ -91,9 +91,9 @@ static uint64_t
 bmap_indirect(struct fs_info *fs, uint64_t start, uint32_t block,
 	      int levels, size_t *nblocks)
 {
-    const uint32_t shft_per_blk = fs->block_shift - UFS_SB(fs)->addr_shift;
-    const uint32_t addr_count = (1 << shft_per_blk);
-    const uint32_t mask_per_blk = addr_count - 1;
+    uint32_t shft_per_blk = fs->block_shift - UFS_SB(fs)->addr_shift;
+    uint32_t addr_count = (1 << shft_per_blk);
+    uint32_t mask_per_blk = addr_count - 1;
     const uint8_t *blk = NULL;
     uint32_t index = 0;
 
@@ -190,7 +190,7 @@ int ufs_next_extent(struct inode *inode, uint32_t lstart)
 	 * sectors into pstart (sector start address).
 	 */
 	inode->next_extent.pstart =
-	    ((sector_t) (block << frag_shift) >> SECTOR_SHIFT(fs)) |
+	    ((sector_t) (block << (frag_shift - SECTOR_SHIFT(fs)))) |
 	    (lstart & blkmask);
 
     /*
